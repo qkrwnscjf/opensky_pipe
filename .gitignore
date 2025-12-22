@@ -1,0 +1,26 @@
+# 1. 파이썬 가상환경 (용량이 크고, 남의 컴퓨터에선 필요 없음)
+venv/
+env/
+.env
+
+# 2. 맥(Mac) 시스템 파일 (지저분함)
+.DS_Store
+
+# 3. 데이터 파일 (보안상 위험하거나 용량이 큼)
+*.parquet
+*.csv
+*.json
+
+# 4. Spark/Java 관련 임시 폴더
+checkpoints/
+checkpoints_dual/
+metastore_db/
+*.log
+
+# 5. IDE 설정 파일 (VSCode 등)
+.vscode/
+.idea/
+
+# 6. 파이썬 컴파일 파일
+__pycache__/
+*.pyc
