@@ -24,3 +24,19 @@ metastore_db/
 # 6. 파이썬 컴파일 파일
 __pycache__/
 *.pyc
+
+# 7. 문서
+docs/
+scripts/
+zookeeper_data/
+zookeeper_log/
+pipeline.md
+
+# 8. Kafka 브로커 실제 데이터 (용량 크고 재현 가능한 데이터라 커밋 불필요)
+kafka_data/
+
+# 9. Claude Code 로컬/개인 설정 (팀 공유용 아님)
+.claude/settings.local.json
+.claude/settings.json
+.claudeignore
+CLAUDE.md

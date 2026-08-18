@@ -1,5 +1,3 @@
-version: '3'
-
 services:
   # 1. Zookeeper (기존 유지)
   zookeeper:
@@ -8,6 +6,9 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - ./zookeeper_data:/var/lib/zookeeper/data
+      - ./zookeeper_log:/var/lib/zookeeper/log
 
   # 2. Kafka (기존 유지)
   kafka:
@@ -17,6 +18,8 @@ services:
       - "9092:9092"
     depends_on:
       - zookeeper
+    volumes:
+      - ./kafka_data:/var/lib/kafka/data
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
@@ -24,17 +27,23 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Phase 1 (docs/EXPANSION_PLAN.md): 새로 생성되는 토픽의 기본 파티션 수. 이미 존재하는
+      # flight_data_raw 토픽에는 소급 적용되지 않으므로, 기존 토픽은 `kafka-topics --alter`로 늘려야 함.
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_LOG_RETENTION_HOURS: 1 
+      KAFKA_LOG_RETENTION_BYTES: 536870912  # 512MB
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
 
   # 3. MinIO (New! - AWS S3 역할을 하는 저장소)
   minio:
     image: minio/minio
     container_name: minio
     ports:
-      - "9000:9000" # API 포트 (Spark가 여기로 데이터 보냄)
-      - "9001:9001" # 관리자 콘솔 포트 (웹에서 파일 확인용)
+      - "9000:9000"
+      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_USER}      # AWS Access Key 역할
-      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD} # AWS Secret Key 역할
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -46,11 +55,152 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: ${DB_USER}         # DB 아이디
-      POSTGRES_PASSWORD: ${DB_PASSWORD} # DB 비밀번호
-      POSTGRES_DB: ${DB_NAME}        # DB 이름
+      POSTGRES_USER: ${DB_USER:-myuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mypassword}
+      POSTGRES_DB: ${DB_NAME:-flightdb}
     volumes:
       - pg_data:/var/lib/postgresql/data
+
+  # 5. MinIO 버킷 초기화 (data lake 버킷을 미리 만들어둠 - 없으면 Spark 저장이 계속 실패함)
+  minio-init:
+    image: minio/mc
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_USER:-minioadmin} ${MINIO_PASSWORD:-minioadmin}; do
+        echo 'Waiting for minio...'; sleep 2;
+      done;
+      mc mb -p local/flight-data-lake;
+      exit 0;
+      "
+
+  # 6. Producer (New! - OpenSky 데이터 수집기, 상시 실행)
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: producer
+    command: >
+      bash -c "
+      until python -c 'import socket; s = socket.socket(); s.connect((\"kafka\", 29092))' 2>/dev/null; do
+        echo 'Waiting for kafka...'; sleep 2;
+      done;
+      python src/producer.py
+      "
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - OPENSKY_USER=${OPENSKY_USER:-}
+      - OPENSKY_PASSWORD=${OPENSKY_PASSWORD:-}
+    depends_on:
+      - kafka
+
+  # 7. Spark 상주 스트리밍 잡 (New! - Kafka -> Postgres/MinIO Dual Write)
+  spark:
+    build: .
+    container_name: spark
+    command: >
+      bash -c "
+      until python -c 'import socket; s = socket.socket(); s.connect((\"kafka\", 29092))' 2>/dev/null; do
+        echo 'Waiting for kafka...'; sleep 2;
+      done;
+      /home/airflow/.local/bin/spark-submit \
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.6.0 \
+      /opt/airflow/src/spark_dual_write.py
+      "
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_PASSWORD:-minioadmin}
+      - DB_HOST=postgres
+      - DB_USER=${DB_USER:-myuser}
+      - DB_PASSWORD=${DB_PASSWORD:-mypassword}
+      - DB_NAME=${DB_NAME:-flightdb}
+    volumes:
+      - ./src:/opt/airflow/src
+      # 컨테이너 재시작 시 체크포인트가 유실되면 Kafka earliest offset부터 전체 재처리되어
+      # 이미 적재된 데이터가 중복 저장됨 - 호스트에 마운트해서 재시작 간 이어서 처리되게 함
+      - ./checkpoints/spark_checkpoints_final:/tmp/spark_checkpoints_final
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+
+  # 8. FastAPI 백엔드 (New! - 프론트엔드에 최신 항공기 위치 서빙)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: backend
+    command: uvicorn src.backend.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-myuser}
+      - DB_PASSWORD=${DB_PASSWORD:-mypassword}
+      - DB_NAME=${DB_NAME:-flightdb}
+    depends_on:
+      - postgres
+
+  # [여기서부터 추가] Airflow 섹션
+  airflow:
+    build: .
+    container_name: airflow
+    # [수정] 명령어를 더 명확하고 견고하게 분리 (| 사용)
+    command: |
+      bash -c "
+      echo 'Waiting for airflow-postgres...'
+      until python -c 'import socket; s = socket.socket(); s.connect((\"airflow-postgres\", 5432))' 2>/dev/null; do
+        sleep 1
+      done
+      echo 'Initializing database...'
+      airflow db migrate
+      echo 'Creating admin user...'
+      airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@example.com --password admin || true
+      echo 'Starting scheduler and webserver...'
+      airflow scheduler &
+      exec airflow webserver
+      "
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW_VAR_MINIO_ENDPOINT=http://minio:9000
+      - AIRFLOW_VAR_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - MINIO_ACCESS_KEY=${MINIO_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_PASSWORD:-minioadmin}
+      - DB_USER=${DB_USER:-myuser}
+      - DB_PASSWORD=${DB_PASSWORD:-mypassword}
+      - DB_NAME=${DB_NAME:-flightdb}
+      - DB_HOST=postgres
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    depends_on:
+      - airflow-postgres
+      - kafka
+      - minio
+
+  # Airflow 전용 메타데이터 DB
+  airflow-postgres:
+    image: postgres:13
+    container_name: airflow-postgres
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    ports:
+      - "5433:5432"
 
 volumes:
   minio_data:

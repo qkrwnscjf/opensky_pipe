@@ -1,0 +1,7 @@
+requests
+kafka-python
+python-dotenv
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary

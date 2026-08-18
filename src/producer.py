@@ -1,62 +1,88 @@
 import requests
 import json
-from kafka import KafkaProducer # KafkaProducer 임포트
+import os
+from kafka import KafkaProducer
 from datetime import datetime
-import time # time.sleep을 위해 임포트
+import time
 
-# 1. Kafka Producer 설정
-# Kafka 서버 주소 (Docker로 실행했으므로 localhost:9092)
+# 1. 환경 변수 및 설정
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+OPENSKY_USER = os.getenv("OPENSKY_USER", "")
+OPENSKY_PASSWORD = os.getenv("OPENSKY_PASSWORD", "")
+
+# 1크레딧 최적화 범위 (Area < 25 sq deg)
+# 대한민국 중심부: Lat(33~38.5), Lon(126~130) -> 5.5 * 4 = 22 sq deg
+LAT_MIN, LAT_MAX = 33.0, 38.5
+LON_MIN, LON_MAX = 126.0, 130.0
+
+URL = "https://opensky-network.org/api/states/all"
+PARAMS = {
+    "lamin": LAT_MIN,
+    "lomin": LON_MIN,
+    "lamax": LAT_MAX,
+    "lomax": LON_MAX
+}
+
+# 2. Kafka Producer 설정
 producer = KafkaProducer(
-    bootstrap_servers=['localhost:9092'],
-    # 데이터를 JSON 형식으로 직렬화 (bytes로 변환)
-    value_serializer=lambda v: json.dumps(v).encode('utf-8') 
+    bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+    acks=1, # 안정성을 위해 전송 확인
+    api_version=(2, 5, 0) # API 버전 명시
 )
 
-# 2. API 설정 (이전과 동일)
-LAT_MIN = 33.0
-LAT_MAX = 39.0
-LON_MIN = 124.5
-LON_MAX = 132.0
-url = f"https://opensky-network.org/api/states/all?lamin={LAT_MIN}&lomin={LON_MIN}&lamax={LAT_MAX}&lomax={LON_MAX}"
+# 3. API 세션 설정 (성능 최적화)
+session = requests.Session()
+if OPENSKY_USER and OPENSKY_PASSWORD:
+    session.auth = (OPENSKY_USER, OPENSKY_PASSWORD)
+    print(f"인증된 계정({OPENSKY_USER})으로 수집을 시작합니다.")
+else:
+    print("익명 계정으로 수집을 시작합니다. (일일 제한 주의)")
 
-print("Kafka Producer를 시작합니다. 10초마다 데이터를 전송합니다...")
-
-# 3. 무한 루프를 돌면서 데이터 전송
-try:
-    while True:
-        response = requests.get(url)
+def fetch_and_send():
+    try:
+        response = session.get(URL, params=PARAMS, timeout=10)
         response.raise_for_status()
         data = response.json()
         
-        if data['states']:
-            for state in data['states']:
-                # 전송할 데이터 가공 (필요한 정보만 선택)
-                flight_info = {
-                    "icao24": state[0],
-                    "callsign": state[1].strip() if state[1] else "N/A",
-                    "longitude": state[5],
-                    "latitude": state[6],
-                    "baro_altitude": state[7],
-                    "on_ground": state[8],
-                    "velocity": state[9],
-                    "true_track": state[10],
-                    "vertical_rate": state[11],
-                    "last_updated": data['time'] # 수집된 시간
-                }
-                
-                # Kafka의 'flight_data_raw' 토픽으로 데이터 전송
-                producer.send('flight_data_raw', value=flight_info)
-                
-            print(f"[{datetime.now()}] {len(data['states'])}개의 항공기 정보를 Kafka로 전송했습니다.")
-        else:
+        if not data.get('states'):
             print(f"[{datetime.now()}] 감지된 항공기 없음.")
-            
-        # 10초 대기 (API에 과도한 요청 방지)
-        time.sleep(10) 
+            return
 
-except KeyboardInterrupt:
-    print("Producer를 종료합니다.")
-except Exception as e:
-    print(f"오류 발생: {e}")
-finally:
-    producer.close() # Producer 종료
+        states = data['states']
+        for state in states:
+            flight_info = {
+                "icao24": state[0],
+                "callsign": state[1].strip() if state[1] else "N/A",
+                "origin_country": state[2],
+                "time_position": state[3],
+                "last_contact": state[4],
+                "longitude": state[5],
+                "latitude": state[6],
+                "baro_altitude": state[7],
+                "on_ground": state[8],
+                "velocity": state[9],
+                "true_track": state[10],
+                "vertical_rate": state[11],
+                "geo_altitude": state[13],
+                "squawk": state[14],
+                "timestamp": data['time']
+            }
+            producer.send('flight_data_raw', value=flight_info)
+        
+        producer.flush() # 메시지 전송 보장
+        print(f"[{datetime.now()}] {len(states)}개의 항공기 정보를 전송했습니다.")
+
+    except Exception as e:
+        print(f"데이터 수집 중 오류 발생: {e}")
+
+if __name__ == "__main__":
+    print(f"수집 범위: Lat({LAT_MIN}~{LAT_MAX}), Lon({LON_MIN}~{LON_MAX})")
+    try:
+        while True:
+            fetch_and_send()
+            time.sleep(10) # 10초 주기로 수집
+    except KeyboardInterrupt:
+        print("Producer 종료")
+    finally:
+        producer.close()
