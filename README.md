@@ -13,37 +13,18 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 
 ## 아키텍처
 
-```mermaid
-flowchart TD
-    subgraph Ingestion["수집"]
-        A[OpenSky Network API]
-    end
-    subgraph Messaging["메시징"]
-        B[("Kafka<br/>flight_data_raw")]
-    end
-    subgraph Processing["처리 · Spark Structured Streaming"]
-        C[spark_dual_write.py<br/>10초 마이크로배치]
-    end
-    subgraph Storage["저장"]
-        D[("PostgreSQL<br/>Hot Path")]
-        E[("MinIO · Parquet<br/>Cold Path")]
-    end
-    subgraph Serving["서빙"]
-        F[FastAPI<br/>REST + WebSocket]
-    end
-    subgraph Client["클라이언트"]
-        G[React + Leaflet<br/>flight-ui]
-    end
+### 데이터 흐름
 
-    A -- "10초 폴링" --> B
-    B -- "구독" --> C
-    C -- "append" --> D
-    C -- "append" --> E
-    D -- "LISTEN / NOTIFY" --> F
-    F -- "WebSocket push" --> G
-```
+1. **수집 (Ingestion)** — `producer.py`가 OpenSky Network API를 10초 주기로 폴링해 항공기 텔레메트리(위치·고도·속도 등)를 가져옴
+2. **메시징 (Messaging)** — 수집한 데이터를 Kafka `flight_data_raw` 토픽에 발행
+3. **처리 (Processing)** — Spark Structured Streaming(`spark_dual_write.py`)이 10초 마이크로배치로 토픽을 구독해 파싱·정제
+4. **저장 (Storage)** — 정제된 데이터를 **Dual Write** 방식으로 두 저장소에 동시 적재
+   - **Hot Path** — PostgreSQL `flight_data` 테이블에 append (실시간 서빙용)
+   - **Cold Path** — MinIO(S3 호환)에 Parquet 파일로 append (영구 이력 보관용)
+5. **서빙 (Serving)** — FastAPI 백엔드가 REST(`GET /flights`)와 WebSocket(`/ws/flights`)으로 최신 위치 제공
+6. **시각화 (Client)** — React + Leaflet 기반 `flight-ui`가 실시간 관제 대시보드로 렌더링
 
-### 왜 이런 구조인가
+### 구조 설명
 
 | 설계 포인트 | 이유 |
 | :--- | :--- |
