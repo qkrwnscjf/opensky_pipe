@@ -1,6 +1,55 @@
 # SkyStream: Real-time Flight Data Pipeline
 
-Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이프라인** 프로젝트입니다. OpenSky Network API에서 항공기 텔레메트리를 10초 주기로 수집해 Kafka로 스트리밍하고, Spark Structured Streaming이 이를 Hot Path(PostgreSQL, 실시간 서빙)와 Cold Path(MinIO/Parquet, 영구 이력)에 동시 적재합니다. FastAPI가 REST와 WebSocket으로 최신 위치를 서빙하고, React/Leaflet 기반 관제 UI(`flight-ui/`)가 이를 시각화합니다.
+Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이프라인** 프로젝트입니다. OpenSky Network API에서 항공기 텔레메트리를 10초 주기로 수집해 Kafka로 스트리밍하고, Spark Structured Streaming이 이를 Hot Path(PostgreSQL, 실시간 서빙)와 Cold Path(MinIO/Parquet, 영구 이력)에 동시 적재합니다. FastAPI가 REST와 WebSocket으로 최신 위치를 서빙하고, React/Leaflet 기반 관제 UI가 이를 시각화합니다.
+
+## 핵심 특징
+
+- **Lambda Architecture** — 실시간 처리(Speed Layer)와 영구 이력 보관(Batch Layer)을 하나의 파이프라인에서 동시에 처리
+- **완전 자동화** — `docker-compose up` 한 번으로 수집부터 서빙까지 전 구간이 자동 기동 (수동 단계 없음)
+- **실시간 푸시** — 10초 Polling이 아니라 Postgres `LISTEN`/`NOTIFY` 기반 WebSocket으로 밀리초 단위 반영
+- **실측 기반 트러블슈팅** — 발생한 문제마다 Before/After 수치를 직접 측정해 기록 (아래 트러블슈팅 섹션 참고)
+
+---
+
+## 아키텍처
+
+```mermaid
+flowchart TD
+    subgraph Ingestion["수집"]
+        A[OpenSky Network API]
+    end
+    subgraph Messaging["메시징"]
+        B[("Kafka<br/>flight_data_raw")]
+    end
+    subgraph Processing["처리 · Spark Structured Streaming"]
+        C[spark_dual_write.py<br/>10초 마이크로배치]
+    end
+    subgraph Storage["저장"]
+        D[("PostgreSQL<br/>Hot Path")]
+        E[("MinIO · Parquet<br/>Cold Path")]
+    end
+    subgraph Serving["서빙"]
+        F[FastAPI<br/>REST + WebSocket]
+    end
+    subgraph Client["클라이언트"]
+        G[React + Leaflet<br/>flight-ui]
+    end
+
+    A -- "10초 폴링" --> B
+    B -- "구독" --> C
+    C -- "append" --> D
+    C -- "append" --> E
+    D -- "LISTEN / NOTIFY" --> F
+    F -- "WebSocket push" --> G
+```
+
+### 왜 이런 구조인가
+
+| 설계 포인트 | 이유 |
+| :--- | :--- |
+| **PostgreSQL은 append-only** | 매 폴링마다 새 행을 쌓기만 함. 항공기별 최신 위치만 보려면 `icao24` 기준 `DISTINCT ON`이 필수 (`/flights`가 이미 구현) — 안 하면 지도에 과거 위치가 중복 표시됨. |
+| **MinIO는 모든 이력을 영구 보관** | Postgres는 `db_cleanup` DAG가 1시간마다 오래된 행을 정리하지만, MinIO의 Parquet은 지워지지 않음 — 실시간 서빙과 장기 분석용 데이터를 분리. |
+| **Polling 대신 LISTEN/NOTIFY** | Spark가 배치를 쓴 직후 `pg_notify`를 호출하면 백엔드가 즉시 연결된 WebSocket 클라이언트에 브로드캐스트 — 화면 반영 지연을 평균 5초에서 630ms로 단축. |
 
 ---
 
@@ -16,27 +65,6 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 | Serving API | FastAPI (REST `/flights` + WebSocket `/ws/flights`) |
 | Frontend | React, Leaflet |
 | Infra | Docker / docker-compose |
-
----
-
-## 파이프라인 아키텍처
-
-**Lambda Architecture** 기반으로 실시간 처리(Speed Layer)와 영구 이력 보관(Batch Layer)을 동시에 만족시킵니다.
-
-```
-OpenSky API --(10초 폴링)--> producer.py --> Kafka `flight_data_raw`
-    --> spark_dual_write.py (Spark Structured Streaming, 10초 마이크로배치)
-        --> PostgreSQL `flight_data` (Hot Path, append)
-        --> MinIO s3a://flight-data-lake/raw_data (Cold Path, Parquet)
---> backend/main.py (FastAPI: REST /flights + WS /ws/flights)
---> flight-ui (React + Leaflet, 실시간 관제 대시보드)
-```
-
-- **PostgreSQL은 append-only**입니다. 항공기별 최신 위치만 보려면 `icao24`로 `DISTINCT ON`을 걸어야 하고(`/flights`가 이미 이렇게 구현되어 있음), 5분 이내 데이터만 필터링해 신호가 끊긴 기체를 제외합니다.
-- **MinIO는 모든 원본 이력을 영구 보관**합니다 — Postgres는 `db_cleanup` DAG가 1시간마다 오래된 행을 정리하지만, MinIO의 Parquet은 지워지지 않습니다.
-- **실시간 갱신은 Polling이 아니라 Postgres `LISTEN`/`NOTIFY`**로 이루어집니다. Spark가 배치를 쓴 직후 `pg_notify`를 호출하면 백엔드가 즉시 연결된 WebSocket 클라이언트에 브로드캐스트합니다.
-
-데이터 흐름과 저장 방식에 대한 자세한 설명은 `pipeline.md`를 참고하세요.
 
 ---
 
@@ -109,7 +137,7 @@ Spark 체크포인트가 컨테이너 내부(휘발성 레이어)에만 있어, 
 
 ### 4. Kafka 단일 파티션 → 대용량 배치 처리 지연
 
-실제 OpenSky 인증 계정 없이도 정량적 결과를 남기기 위해 합성 부하 생성기(`scripts/load_test_producer.py`)로 아시아 스케일 트래픽을 흉내내 측정했습니다.
+실제 OpenSky 인증 계정 없이도 정량적 결과를 남기기 위해 합성 부하 생성기로 아시아 스케일 트래픽을 흉내내 측정했습니다.
 
 | 항목 | Before (1 파티션) | After (6 파티션) |
 | :--- | :--- | :--- |
