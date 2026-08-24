@@ -75,6 +75,39 @@ def get_flights():
     return fetch_flights()
 
 
+# 특정 기체의 최근 이동 궤적. WHERE 절이 (icao24, timestamp)를 모두 쓰기 때문에
+# idx_flight_latest (icao24, timestamp DESC) 인덱스를 그대로 활용한다.
+# db_cleanup DAG가 1시간 지난 행을 지우므로 조회 가능한 최대 창도 1시간이다.
+# DISTINCT ON (timestamp): OpenSky가 10초 폴링 사이에 동일한 스냅샷(같은 time 값)을 돌려주면
+# producer가 같은 레코드를 두 번 보내 완전히 동일한 행이 쌓인다. 궤적에 같은 좌표가 중복
+# 정점으로 찍히지 않도록 타임스탬프당 한 점만 남긴다.
+TRAIL_QUERY = text("""
+    SELECT DISTINCT ON (timestamp) latitude, longitude, timestamp
+    FROM flight_data
+    WHERE icao24 = :icao24
+      AND timestamp >= NOW() - (:minutes * INTERVAL '1 minute')
+      AND latitude IS NOT NULL
+      AND longitude IS NOT NULL
+    ORDER BY timestamp ASC
+""")
+
+
+@app.get("/flights/{icao24}/trail")
+def get_flight_trail(icao24: str, minutes: int = 30):
+    """선택한 항공기의 최근 이동 경로를 시간순으로 반환합니다."""
+    minutes = max(1, min(minutes, 60))
+    with engine.connect() as conn:
+        result = conn.execute(TRAIL_QUERY, {"icao24": icao24, "minutes": minutes})
+        return [
+            {
+                "latitude": row.latitude,
+                "longitude": row.longitude,
+                "timestamp": row.timestamp,
+            }
+            for row in result
+        ]
+
+
 # ---------------------------------------------------------------
 # Phase 2 (docs/EXPANSION_PLAN.md): Polling → WebSocket 실시간 푸시
 # ---------------------------------------------------------------

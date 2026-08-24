@@ -39,14 +39,27 @@ if OPENSKY_USER and OPENSKY_PASSWORD:
 else:
     print("익명 계정으로 수집을 시작합니다. (일일 제한 주의)")
 
+# 직전에 전송한 스냅샷의 time 값. OpenSky(특히 익명 티어)는 10초 폴링 사이에 아직 갱신되지
+# 않은 "같은 스냅샷"(동일한 data['time'])을 그대로 돌려주는 경우가 있다. 이를 걸러내지 않으면
+# 좌표·속도까지 완전히 동일한 레코드가 Kafka에 두 번 실려 flight_data에 중복 행으로 쌓인다.
+# (2026-08-20 실측: 정상 동작 중에도 3분당 수십 쌍씩 누적 — docs/BENCHMARKS.md 참고)
+_last_snapshot_time = None
+
+
 def fetch_and_send():
+    global _last_snapshot_time
     try:
         response = session.get(URL, params=PARAMS, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
+
         if not data.get('states'):
             print(f"[{datetime.now()}] 감지된 항공기 없음.")
+            return
+
+        snapshot_time = data.get('time')
+        if snapshot_time is not None and snapshot_time == _last_snapshot_time:
+            print(f"[{datetime.now()}] 이전과 동일한 스냅샷(time={snapshot_time}) — 전송 생략.")
             return
 
         states = data['states']
@@ -71,6 +84,8 @@ def fetch_and_send():
             producer.send('flight_data_raw', value=flight_info)
         
         producer.flush() # 메시지 전송 보장
+        # flush 성공 후에만 갱신 — 전송에 실패했다면 다음 주기에 같은 스냅샷을 다시 시도해야 한다.
+        _last_snapshot_time = snapshot_time
         print(f"[{datetime.now()}] {len(states)}개의 항공기 정보를 전송했습니다.")
 
     except Exception as e:

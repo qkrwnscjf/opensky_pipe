@@ -55,11 +55,16 @@ schema = StructType([
 # ---------------------------------------------------------------
 kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
+# failOnDataLoss=false: 체크포인트에 남은 오프셋이 Kafka retention(1시간)에 밀려 이미 삭제된
+# 경우, 기본값(true)이면 OffsetOutOfRangeException으로 스트림 자체가 죽는다. 스택을 한 시간 넘게
+# 꺼뒀다 다시 켜면 항상 재현되는 문제라, 유실분은 건너뛰고 남아있는 가장 이른 오프셋부터 이어가게 한다.
+# (원본 이력은 MinIO 콜드 패스에 이미 보관되어 있으므로 여기서의 skip은 복구 불가능한 손실이 아니다.)
 df_raw = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", kafka_bootstrap) \
     .option("subscribe", "flight_data_raw") \
     .option("startingOffsets", "earliest") \
+    .option("failOnDataLoss", "false") \
     .load()
 
 # ---------------------------------------------------------------
