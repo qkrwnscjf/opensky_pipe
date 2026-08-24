@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Polyline, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import './App.css';
@@ -26,6 +26,16 @@ const getFlagUrl = (country) => {
 
 const DEFAULT_CENTER = [37.5, 127.0];
 
+// 고도대별 색상 — 실제 항공 추적 서비스처럼 순항 고도를 한눈에 구분한다.
+const ALTITUDE_BANDS = [
+  { key: 'low', label: 'Low · under 3 km', max: 3000, color: '#f59e0b' },
+  { key: 'cruise', label: 'Cruise · 3–9 km', max: 9000, color: '#2563eb' },
+  { key: 'high', label: 'High · 9 km+', max: Infinity, color: '#06b6d4' },
+];
+
+const bandFor = (altitude) =>
+  ALTITUDE_BANDS.find((b) => (altitude ?? 0) < b.max) || ALTITUDE_BANDS[ALTITUDE_BANDS.length - 1];
+
 const DEMO_STEPS = [
   { label: 'Search & Discover' },
   { label: 'Track Live' },
@@ -33,19 +43,24 @@ const DEMO_STEPS = [
   { label: 'Light & Dark' },
 ];
 
-function MapFocusHandler({ center }) {
+// mode='fly'는 선택 시 확대 이동, mode='pan'은 Follow 모드에서 줌 유지한 채 따라가기
+function MapFocusHandler({ center, mode }) {
   const map = useMap();
   useEffect(() => {
-    if (center) {
+    if (!center) return;
+    if (mode === 'pan') {
+      map.panTo(center, { animate: true, duration: 0.8 });
+    } else {
       map.flyTo(center, 9, { duration: 1.2, easeLinearity: 0.25 });
     }
-  }, [center, map]);
+  }, [center, mode, map]);
   return null;
 }
 
-const aircraftIcon = (heading, active, theme) => {
-  const color = theme === 'dark' ? (active ? '#22d3ee' : '#38bdf8') : (active ? '#1d4ed8' : '#2563eb');
+const aircraftIcon = (flight, active, theme) => {
+  const color = bandFor(flight.altitude).color;
   const stroke = theme === 'dark' ? '#061018' : '#ffffff';
+  const heading = flight.true_track;
   return L.divIcon({
     className: `aircraft-icon ${active ? 'active' : ''}`,
     html: `
@@ -81,25 +96,40 @@ function useReveal() {
   return [ref, visible];
 }
 
-// animates a number counting up to `target` once `start` becomes true
+// 목표치가 바뀔 때마다 "현재 표시 중인 값"에서 새 값으로 다시 트윈한다.
+// (최초 1회만 카운트업하던 기존 동작 → 실시간 push마다 숫자가 굴러가도록)
 function useCountUp(target, duration, start) {
   const [value, setValue] = useState(0);
+  const fromRef = useRef(0);
   useEffect(() => {
     if (!start) return undefined;
+    const from = fromRef.current;
+    const delta = target - from;
+    if (delta === 0) return undefined;
     let raf;
     const t0 = performance.now();
     const tick = (now) => {
       const progress = Math.min((now - t0) / duration, 1);
       const eased = 1 - Math.pow(1 - progress, 3);
-      setValue(Math.round(target * eased));
+      const next = Math.round(from + delta * eased);
+      fromRef.current = next;
+      setValue(next);
       if (progress < 1) raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target, duration, start]);
   return value;
 }
+
+const readInitialPinned = () => {
+  try {
+    const raw = window.localStorage.getItem('skystream-pinned');
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (e) {
+    return new Set();
+  }
+};
 
 const readInitialTheme = () => {
   if (typeof window === 'undefined') return 'light';
@@ -123,6 +153,13 @@ function App() {
   const [connected, setConnected] = useState(true);
   const [clock, setClock] = useState(new Date());
   const [theme, setTheme] = useState(readInitialTheme);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [pulse, setPulse] = useState(0);
+  const [followMode, setFollowMode] = useState(false);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const [trail, setTrail] = useState([]);
+  const [pinned, setPinned] = useState(readInitialPinned);
+  const searchRef = useRef(null);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -132,6 +169,24 @@ function App() {
       // ignore storage failures
     }
   }, [theme]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('skystream-pinned', JSON.stringify([...pinned]));
+    } catch (e) {
+      // ignore storage failures
+    }
+  }, [pinned]);
+
+  const togglePin = (icao24, e) => {
+    e.stopPropagation(); // 카드 선택과 겹치지 않도록
+    setPinned((prev) => {
+      const next = new Set(prev);
+      if (next.has(icao24)) next.delete(icao24);
+      else next.add(icao24);
+      return next;
+    });
+  };
 
   // Phase 2 (docs/EXPANSION_PLAN.md): 10초 폴링 대신 WebSocket 실시간 푸시를 구독.
   // 백엔드가 배치 완료 시점에 push하므로, 연결이 끊기면 3초 뒤 자동 재연결한다.
@@ -145,6 +200,9 @@ function App() {
       ws.onmessage = (event) => {
         try {
           setFlights(JSON.parse(event.data));
+          setLastUpdate(new Date());
+          setHasLoadedOnce(true);
+          setPulse((p) => p + 1); // 상단 펄스 바 애니메이션 재시작용
         } catch (e) {
           console.error('FLIGHT_DATA_PARSE_FAILED:', e);
         }
@@ -172,14 +230,19 @@ function App() {
 
   const filteredFlights = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return flights;
-    return flights.filter(
-      (f) =>
-        f.callsign?.toLowerCase().includes(q) ||
-        f.icao24?.toLowerCase().includes(q) ||
-        f.origin_country?.toLowerCase().includes(q)
+    const base = !q
+      ? flights
+      : flights.filter(
+          (f) =>
+            f.callsign?.toLowerCase().includes(q) ||
+            f.icao24?.toLowerCase().includes(q) ||
+            f.origin_country?.toLowerCase().includes(q)
+        );
+    if (pinned.size === 0) return base;
+    return [...base].sort(
+      (a, b) => (pinned.has(b.icao24) ? 1 : 0) - (pinned.has(a.icao24) ? 1 : 0)
     );
-  }, [flights, query]);
+  }, [flights, query, pinned]);
 
   const stats = useMemo(() => {
     if (flights.length === 0) return { count: 0, avgAlt: 0, avgSpd: 0, countries: 0 };
@@ -205,6 +268,68 @@ function App() {
     setMapCenter([flight.latitude, flight.longitude]);
   };
 
+  // 선택한 기체의 최근 궤적을 불러온다. 이후 위치는 WebSocket push가 올 때마다 이어붙인다.
+  useEffect(() => {
+    if (!selectedIcao) {
+      setTrail([]);
+      return undefined;
+    }
+    let cancelled = false;
+    fetch(`http://localhost:8000/flights/${selectedIcao}/trail`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((points) => {
+        if (!cancelled) setTrail(points.map((p) => [p.latitude, p.longitude]));
+      })
+      .catch(() => {
+        if (!cancelled) setTrail([]); // 궤적은 부가 정보라, 실패해도 지도는 그대로 둔다
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedIcao]);
+
+  useEffect(() => {
+    if (!selectedFlight) return;
+    setTrail((prev) => {
+      const last = prev[prev.length - 1];
+      const next = [selectedFlight.latitude, selectedFlight.longitude];
+      if (last && last[0] === next[0] && last[1] === next[1]) return prev;
+      return [...prev, next];
+    });
+  }, [selectedFlight]);
+
+  // Follow 모드: 선택한 기체가 움직일 때마다 지도가 따라간다.
+  useEffect(() => {
+    if (!followMode || !selectedFlight) return;
+    setMapCenter([selectedFlight.latitude, selectedFlight.longitude]);
+  }, [followMode, selectedFlight]);
+
+  // 선택이 풀리면 Follow도 함께 해제 (따라갈 대상이 없으므로)
+  useEffect(() => {
+    if (!selectedIcao) setFollowMode(false);
+  }, [selectedIcao]);
+
+  // 키보드 단축키: '/' 검색 포커스, Esc 선택 해제
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        setSelectedIcao(null);
+        return;
+      }
+      const tag = e.target?.tagName;
+      if (e.key === '/' && tag !== 'INPUT' && tag !== 'TEXTAREA') {
+        e.preventDefault();
+        searchRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        searchRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // clock이 1초마다 갱신되므로 이 값도 자연스럽게 카운트업된다.
+  const secondsAgo = lastUpdate ? Math.max(0, Math.round((clock - lastUpdate) / 1000)) : null;
+
   const [heroRef, heroVisible] = useReveal();
   const [showcaseRef, showcaseVisible] = useReveal();
   const [mapRef, mapVisible] = useReveal();
@@ -218,6 +343,8 @@ function App() {
 
   return (
     <div className="page">
+      {/* WebSocket push가 올 때마다 key가 바뀌며 애니메이션이 재시작된다 */}
+      {pulse > 0 && <div className="live-pulse" key={pulse} />}
       <nav className="topnav">
         <a className="brand" href="#top">
           <span className="brand-mark">✈</span>
@@ -232,6 +359,12 @@ function App() {
             <span className="status-dot" />
             {connected ? 'LIVE' : 'OFFLINE'}
           </div>
+          <span
+            className="nav-updated mono"
+            title="Time since the last WebSocket push"
+          >
+            {secondsAgo === null ? '—' : `${secondsAgo}s ago`}
+          </span>
           <span className="nav-clock mono">{clock.toLocaleTimeString('en-GB')}</span>
           <button
             className="theme-toggle"
@@ -292,10 +425,19 @@ function App() {
         </div>
 
         <div className="device-frame">
-          <div className="macbook">
-            <div className="macbook-lid">
-              <div className="macbook-camera" />
-              <div className="macbook-screen">
+          <div className="mac-window">
+            <div className="mac-titlebar">
+              <div className="mac-dots">
+                <span className="mac-dot red" />
+                <span className="mac-dot yellow" />
+                <span className="mac-dot green" />
+              </div>
+              <div className="mac-urlbar">
+                <span className="mac-lock">🔒</span> localhost:3000
+              </div>
+              <div className="mac-titlebar-spacer" />
+            </div>
+            <div className="mac-viewport">
                 <div className={`demo-panel ${demoStep === 0 ? 'active' : ''}`}>
                   <div className="mock-topbar">
                     <div className="mock-search">
@@ -378,20 +520,6 @@ function App() {
                 </div>
               </div>
             </div>
-            <div className="macbook-hinge" />
-            <div className="macbook-keyboard-deck">
-              <div className="macbook-keys">
-                {[0, 1, 2].map((row) => (
-                  <div className="key-row" key={row}>
-                    {row < 2
-                      ? Array.from({ length: 12 }).map((_, i) => <span className="key" key={i} />)
-                      : <span className="key key-space" />}
-                  </div>
-                ))}
-              </div>
-              <div className="macbook-trackpad" />
-            </div>
-          </div>
 
           <div className="demo-steps">
             {DEMO_STEPS.map((step, i) => (
@@ -411,7 +539,7 @@ function App() {
       <section id="airspace" className={`map-section ${mapVisible ? 'in-view' : ''}`} ref={mapRef}>
         <div className="section-head">
           <h2>Live Airspace</h2>
-          <p>Live aircraft positions, refreshed every 10 seconds.</p>
+          <p>Live aircraft positions, pushed over WebSocket the moment each batch lands.</p>
         </div>
         <div className="map-frame">
           <MapContainer
@@ -429,17 +557,87 @@ function App() {
                   : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
               }
             />
-            <MapFocusHandler center={mapCenter} />
+            <MapFocusHandler center={mapCenter} mode={followMode ? 'pan' : 'fly'} />
+            {trail.length > 1 && (
+              <Polyline
+                positions={trail}
+                pathOptions={{
+                  color: bandFor(selectedFlight?.altitude).color,
+                  weight: 2.5,
+                  opacity: 0.75,
+                  dashArray: '5 7',
+                }}
+              />
+            )}
             {flights.map((flight) => (
               <Marker
                 key={flight.icao24}
                 position={[flight.latitude, flight.longitude]}
-                icon={aircraftIcon(flight.true_track, selectedIcao === flight.icao24, theme)}
+                icon={aircraftIcon(flight, selectedIcao === flight.icao24, theme)}
                 eventHandlers={{ click: () => handleSelect(flight) }}
               />
             ))}
           </MapContainer>
-          {flights.length === 0 && <div className="map-empty">Scanning airspace…</div>}
+
+          {/* 지도만 보고 있어도 핵심 수치가 보이도록 하는 HUD */}
+          <div className="map-hud">
+            <div className="hud-row">
+              <span>Aircraft</span>
+              <b>{flights.length}</b>
+            </div>
+            <div className="hud-row">
+              <span>Avg. alt</span>
+              <b>{stats.avgAlt.toLocaleString()} m</b>
+            </div>
+            <div className="hud-row">
+              <span>Updated</span>
+              <b>{secondsAgo === null ? '—' : `${secondsAgo}s ago`}</b>
+            </div>
+          </div>
+
+          <div className="map-legend">
+            {ALTITUDE_BANDS.map((band) => (
+              <div className="legend-item" key={band.key}>
+                <span className="legend-swatch" style={{ background: band.color }} />
+                {band.label}
+              </div>
+            ))}
+          </div>
+
+          {selectedFlight && (
+            <button
+              className={`follow-btn ${followMode ? 'active' : ''}`}
+              onClick={() => setFollowMode((v) => !v)}
+              title="Keep the selected aircraft centered as it moves"
+            >
+              {followMode ? '◉ Following' : '◎ Follow'} {selectedFlight.callsign || selectedFlight.icao24}
+            </button>
+          )}
+
+          {!connected && (
+            <div className="map-overlay">
+              <div className="overlay-card">
+                <div className="overlay-icon">🔌</div>
+                <div className="overlay-title">Backend disconnected</div>
+                <div className="overlay-desc">
+                  Can’t reach <code>ws://localhost:8000</code>. Start the pipeline with{' '}
+                  <code>docker-compose up -d</code>.
+                </div>
+                <div className="overlay-retry">
+                  <span className="retry-dot" /> Reconnecting…
+                </div>
+              </div>
+            </div>
+          )}
+          {connected && !hasLoadedOnce && (
+            <div className="map-overlay subtle">
+              <div className="overlay-card">
+                <div className="overlay-spinner" />
+                <div className="overlay-title">Scanning airspace…</div>
+                <div className="overlay-desc">Waiting for the first batch from Spark.</div>
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -448,29 +646,81 @@ function App() {
           <h2>Active Fleet</h2>
           <div className="fleet-search">
             <input
+              ref={searchRef}
               type="text"
               placeholder="Search callsign, ICAO24, country…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
+            <kbd className="search-kbd" title="Press / to focus search">/</kbd>
+            {pinned.size > 0 && (
+              <span className="fleet-pinned-count" title="Pinned aircraft">★ {pinned.size}</span>
+            )}
             <span className="fleet-count">{filteredFlights.length}</span>
           </div>
         </div>
 
-        {flights.length === 0 && <div className="empty-state">Scanning airspace…</div>}
-        {flights.length > 0 && filteredFlights.length === 0 && (
-          <div className="empty-state">No aircraft match your search.</div>
+        {!connected && (
+          <div className="empty-state offline-state">
+            <div className="overlay-icon">🔌</div>
+            <div className="overlay-title">Backend disconnected</div>
+            <div className="overlay-desc">
+              Run <code>docker-compose up -d</code>, then this list fills itself — no refresh needed.
+            </div>
+            <div className="overlay-retry">
+              <span className="retry-dot" /> Reconnecting…
+            </div>
+          </div>
+        )}
+
+        {/* 첫 배치를 기다리는 동안은 문구 대신 카드 모양 스켈레톤을 보여준다 */}
+        {connected && !hasLoadedOnce && (
+          <div className="fleet-grid">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div className="fleet-card skeleton" key={i}>
+                <div className="sk-head">
+                  <div className="sk-box" />
+                  <div className="sk-lines">
+                    <div className="sk-line sk-w60" />
+                    <div className="sk-line sk-w40" />
+                  </div>
+                </div>
+                <div className="sk-grid">
+                  <div className="sk-line" />
+                  <div className="sk-line" />
+                  <div className="sk-line" />
+                  <div className="sk-line" />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {connected && hasLoadedOnce && filteredFlights.length === 0 && (
+          <div className="empty-state">
+            {flights.length === 0 ? 'No aircraft in range right now.' : 'No aircraft match your search.'}
+          </div>
         )}
 
         <div className="fleet-grid">
           {filteredFlights.map((flight) => {
             const isActive = selectedIcao === flight.icao24;
+            const isPinned = pinned.has(flight.icao24);
             return (
               <div
                 key={flight.icao24}
-                className={`fleet-card ${isActive ? 'active' : ''}`}
+                className={`fleet-card ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}`}
                 onClick={() => handleSelect(flight)}
               >
+                <span className="fleet-band" style={{ background: bandFor(flight.altitude).color }} />
+                <button
+                  className={`pin-btn ${isPinned ? 'active' : ''}`}
+                  onClick={(e) => togglePin(flight.icao24, e)}
+                  title={isPinned ? 'Unpin from top' : 'Pin to top'}
+                  aria-label={isPinned ? 'Unpin aircraft' : 'Pin aircraft to top'}
+                >
+                  {isPinned ? '★' : '☆'}
+                </button>
                 <div className="fleet-card-top">
                   {getFlagUrl(flight.origin_country) && (
                     <img className="fleet-flag" src={getFlagUrl(flight.origin_country)} alt={flight.origin_country} />
