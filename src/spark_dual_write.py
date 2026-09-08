@@ -1,5 +1,9 @@
+import json
 import os
 import sys
+import threading
+import time
+
 import psycopg2
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, to_timestamp, from_unixtime
@@ -182,6 +186,60 @@ def save_to_sinks(batch_df, batch_id):
     batch_df.unpersist()
 
 # ---------------------------------------------------------------
+# A-1 (docs/EXPANSION_PLAN.md): 배치 메트릭 관측
+# ---------------------------------------------------------------
+# 이전에는 "다음 배치 로그와의 시각 차이"로 처리 시간을 역산했는데, 그 값에는 트리거
+# 대기가 섞여 있어 같은 크기(~2,100건) 배치에서도 6.65~19.33초로 3배 흔들렸다.
+# Spark는 durationMs.addBatch로 실제 처리 시간을, numInputRows로 입력 행 수를 이미
+# 계산해두므로 역산 대신 그 값을 읽는다.
+#
+# StreamingQueryListener(py4j 콜백) 대신 폴링을 쓴 이유: 콜백 서버 설정 없이 동일한
+# 지표를 얻을 수 있고 실패 지점이 적다.
+#
+# lastProgress가 아니라 recentProgress(최근 N개 배치 배열, 기본 100)를 훑는다.
+# lastProgress 하나만 보면 폴링 간격 안에 배치가 두 개 끝났을 때 중간 배치가 조용히
+# 사라진다. 트리거 간격이 10초라 정상 상태에서는 문제가 없지만, 백로그를 소화하는
+# 동안 Spark는 트리거 간격을 무시하고 배치를 연달아 실행한다 — 즉 A-3(백프레셔)
+# 측정처럼 데이터가 가장 필요한 국면에서 하필 구멍이 난다.
+def start_metrics_reporter(query, interval_sec=1):
+    def _emit(progress):
+        sources = progress.get("sources") or [{}]
+        print("SPARK_METRIC " + json.dumps({
+            "batchId": progress.get("batchId"),
+            "timestamp": progress.get("timestamp"),
+            "numInputRows": progress.get("numInputRows"),
+            "inputRowsPerSecond": progress.get("inputRowsPerSecond"),
+            "processedRowsPerSecond": progress.get("processedRowsPerSecond"),
+            "durationMs": progress.get("durationMs"),
+            "endOffset": sources[0].get("endOffset"),
+        }, default=str))
+
+    def _run():
+        last_emitted = -1
+        while query.isActive:
+            try:
+                pending = sorted(
+                    (p for p in (query.recentProgress or [])
+                     if p.get("batchId") is not None and p["batchId"] > last_emitted),
+                    key=lambda p: p["batchId"],
+                )
+                for progress in pending:
+                    batch_id = progress["batchId"]
+                    # recentProgress 버퍼(기본 100개)보다 빨리 배치가 지나가면 여기서도
+                    # 놓친다. 조용히 넘어가면 측정값이 완전한 것처럼 보이므로, 누락
+                    # 구간을 명시해 계측기가 자기 사각지대를 스스로 보고하게 한다.
+                    if last_emitted >= 0 and batch_id > last_emitted + 1:
+                        print(f"METRIC_GAP: batch {last_emitted + 1}~{batch_id - 1} 누락")
+                    _emit(progress)
+                    last_emitted = batch_id
+            except Exception as e:
+                print(f"METRIC_WARNING: {e}")
+            time.sleep(interval_sec)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ---------------------------------------------------------------
 # 6. 실행 (Checkpoint 관리)
 # ---------------------------------------------------------------
 checkpoint_dir = "/tmp/spark_checkpoints_final"
@@ -194,6 +252,8 @@ query = df_processed.writeStream \
     .trigger(processingTime="10 seconds") \
     .option("checkpointLocation", checkpoint_dir) \
     .start()
+
+start_metrics_reporter(query)
 
 print("TACTICAL_ETL_SYSTEM: OPERATIONAL")
 query.awaitTermination()
