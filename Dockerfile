@@ -20,6 +20,15 @@ RUN ln -sfn /usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture) /usr/lib/j
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PYTHONUNBUFFERED=1
 
+# Spark 체크포인트 디렉터리를 이미지 안에 미리 만들고 airflow 소유로 넘긴다.
+# docker-compose에서 이 경로들은 익명 볼륨이다(세션마다 초기화 — EXPANSION_PLAN 0.4).
+# Docker는 이미지에 없는 경로에 볼륨을 붙일 때 root:root 0755로 만드는데, 컨테이너는
+# airflow(uid 50000)로 돌기 때문에 체크포인트를 쓰지 못해 스트림이 죽고 재시작을
+# 반복한다(2026-09-09 실측: RestartCount 43). 이미지에 미리 있으면 볼륨이 그 소유권을
+# 물려받아 문제가 사라진다.
+RUN mkdir -p /tmp/spark_checkpoints_final /tmp/spark_checkpoints_cold \
+  && chown -R airflow:root /tmp/spark_checkpoints_final /tmp/spark_checkpoints_cold
+
 # 3. Airflow 계정으로 다시 전환 (보안상 필수)
 USER airflow
 

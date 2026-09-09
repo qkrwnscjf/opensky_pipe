@@ -6,9 +6,12 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    # 세션 휘발 스토어 (docs/EXPANSION_PLAN.md 0.4). 익명 볼륨이라 컨테이너가
+    # 새로 만들어질 때(= docker compose down 후 up) 빈 상태로 시작한다.
+    # 세션 '중'의 재시작에서는 같은 컨테이너를 다시 띄우므로 데이터가 유지된다.
     volumes:
-      - ./zookeeper_data:/var/lib/zookeeper/data
-      - ./zookeeper_log:/var/lib/zookeeper/log
+      - /var/lib/zookeeper/data
+      - /var/lib/zookeeper/log
 
   # 2. Kafka (기존 유지)
   kafka:
@@ -18,8 +21,9 @@ services:
       - "9092:9092"
     depends_on:
       - zookeeper
+    # 세션 휘발 (0.4). Zookeeper와 짝으로 비워져야 cluster ID가 어긋나지 않는다.
     volumes:
-      - ./kafka_data:/var/lib/kafka/data
+      - /var/lib/kafka/data
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
@@ -58,8 +62,10 @@ services:
       POSTGRES_USER: ${DB_USER:-myuser}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-mypassword}
       POSTGRES_DB: ${DB_NAME:-flightdb}
+    # 세션 휘발 (0.4). flight_data 테이블은 Spark JDBC writer가 첫 append 때
+    # 자동 생성하고, 인덱스는 ensure_index()가 만들므로 빈 DB로 시작해도 된다.
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - /var/lib/postgresql/data
 
   # 5. MinIO 버킷 초기화 (data lake 버킷을 미리 만들어둠 - 없으면 Spark 저장이 계속 실패함)
   minio-init:
@@ -82,6 +88,7 @@ services:
       context: .
       dockerfile: Dockerfile.app
     container_name: producer
+    restart: unless-stopped
     command: >
       bash -c "
       until python -c 'import socket; s = socket.socket(); s.connect((\"kafka\", 29092))' 2>/dev/null; do
@@ -100,6 +107,11 @@ services:
   spark:
     build: .
     container_name: spark
+    # 크래시(2026-09-09 OOM 등) 시 자동 복구. 중요한 건 '같은 컨테이너를 다시
+    # 띄운다'는 점이다 — 익명 볼륨의 체크포인트가 유지되므로 Kafka를 처음부터
+    # 다시 읽어 콜드 패스에 중복을 쌓는 일이 없다. 수동 재생성(up --build)만
+    # 볼륨을 새로 만든다.
+    restart: unless-stopped
     command: >
       bash -c "
       until python -c 'import socket; s = socket.socket(); s.connect((\"kafka\", 29092))' 2>/dev/null; do
@@ -136,11 +148,15 @@ services:
       - ./src:/opt/airflow/src
       # 컨테이너 재시작 시 체크포인트가 유실되면 Kafka earliest offset부터 전체 재처리되어
       # 이미 적재된 데이터가 중복 저장됨 - 호스트에 마운트해서 재시작 간 이어서 처리되게 함
-      - ./checkpoints/spark_checkpoints_final:/tmp/spark_checkpoints_final
-      # 콜드 패스는 별도 스트리밍 쿼리라 체크포인트도 따로다. 마운트하지 않으면
-      # spark 재시작 때마다 Kafka earliest부터 다시 읽어 학습 데이터에 중복이 쌓인다
-      # (핫 패스가 2026-08-20에 겪은 것과 같은 문제).
-      - ./checkpoints/spark_checkpoints_cold:/tmp/spark_checkpoints_cold
+      # 체크포인트는 Kafka 데이터와 '짝'이다. Kafka를 비우면 오프셋이 0부터
+      # 다시 매겨지므로, 이전 세션의 높은 오프셋을 가리키는 체크포인트가 남아
+      # 있으면 어긋난다. 그래서 둘을 같은 수명(익명 볼륨)으로 묶는다.
+      - /tmp/spark_checkpoints_final
+      # 콜드 패스는 별도 스트리밍 쿼리라 체크포인트도 따로다. 세션 '중'에 spark를
+      # 재빌드(up --build)하면 컨테이너가 새로 만들어져 이 볼륨이 비고, Kafka에
+      # 남아있는 최대 1시간치를 콜드 패스에 다시 쓴다 → 학습 데이터에 중복.
+      # 세션 중에는 재빌드 대신 `docker compose restart spark`를 쓸 것.
+      - /tmp/spark_checkpoints_cold
     depends_on:
       kafka:
         condition: service_started
@@ -155,6 +171,7 @@ services:
       context: .
       dockerfile: Dockerfile.app
     container_name: backend
+    restart: unless-stopped
     command: uvicorn src.backend.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
@@ -221,7 +238,7 @@ services:
       - "5433:5432"
 
 volumes:
+  # 유일한 영구 저장소. B-2(궤적 예측) 학습 데이터의 원천이므로 세션을 넘어
+  # 보존된다. 나머지 스토어는 전부 익명 볼륨으로 세션마다 비워진다 (0.4).
   minio_data:
-    driver: local
-  pg_data:
     driver: local
