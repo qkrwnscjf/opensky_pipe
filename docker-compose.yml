@@ -118,6 +118,12 @@ services:
       - DB_USER=${DB_USER:-myuser}
       - DB_PASSWORD=${DB_PASSWORD:-mypassword}
       - DB_NAME=${DB_NAME:-flightdb}
+      # 콜드 패스 적재 경로. 기본값이 실데이터 경로다.
+      # 합성 부하 테스트(scripts/load_test_producer.py)는 같은 Kafka 토픽을 쓰므로,
+      # 가짜 레코드가 학습 데이터(docs/EXPANSION_PLAN.md 0.4)에 섞이지 않도록
+      # 테스트 시에만 경로를 덮어쓴다:
+      #   MINIO_COLD_PATH=s3a://flight-data-lake/synthetic docker compose up -d spark
+      - MINIO_COLD_PATH=${MINIO_COLD_PATH:-s3a://flight-data-lake/raw_data}
     volumes:
       - ./src:/opt/airflow/src
       # 컨테이너 재시작 시 체크포인트가 유실되면 Kafka earliest offset부터 전체 재처리되어

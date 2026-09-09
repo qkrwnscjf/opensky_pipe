@@ -145,10 +145,36 @@ def notify_flight_update():
         print(f"NOTIFY_WARNING: {e}")
 
 
+# 콜드 패스 적재 경로. 기본값이 실데이터 경로이고, 합성 부하 테스트일 때만 덮어쓴다.
+#
+# 2026-09-09 데이터 수명 정책(docs/EXPANSION_PLAN.md 0.4)에서 MinIO가 이 시스템의
+# 유일한 영구 저장소이자 B-2(궤적 예측) 학습 데이터의 원천으로 확정됐다. 그런데
+# scripts/load_test_producer.py는 같은 flight_data_raw 토픽에 랜덤 icao24의 가짜
+# 레코드를 흘려보내므로, 그대로 두면 존재하지 않는 항공기가 학습 데이터에 섞인다.
+# 날짜 파티셔닝(Phase 1-1)이 아직 없어 나중에 경로로 걸러낼 수단도 없다.
+#
+# 따라서 부하 테스트 시에는 경로 자체를 분리한다:
+#   MINIO_COLD_PATH=s3a://flight-data-lake/synthetic docker compose up -d spark
+COLD_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/raw_data")
+
+
 def save_to_sinks(batch_df, batch_id):
+    # A-1은 "배치 시간의 78%가 addBatch"까지만 밝혔고, 그 안이 Postgres write와
+    # MinIO write 중 어디에 쏠려 있는지는 블랙박스로 남아 있었다. 두 구간을 각각
+    # 재서 SINK_METRIC으로 내보낸다. 이 비율이 나와야 다음 개선(두 싱크 병렬화 /
+    # 콜드 패스 분리 / JDBC 튜닝) 중 무엇이 실효가 있는지 예측하고 착수할 수 있다.
+    timings = {}
+
+    def _timed(name, fn):
+        started = time.perf_counter()
+        try:
+            return fn()
+        finally:
+            timings[name] = round((time.perf_counter() - started) * 1000, 1)
+
     batch_df.persist()
-    count = batch_df.count()
-    
+    count = _timed("count", batch_df.count)
+
     if count > 0:
         print(f"[{batch_id}] {count} records processing...")
         try:
@@ -160,30 +186,37 @@ def save_to_sinks(batch_df, batch_id):
             db_password = os.getenv("DB_PASSWORD", "mypassword")
             jdbc_url = f"jdbc:postgresql://{db_host}:{db_port}/{db_name}"
 
-            batch_df.write \
-                .mode("append") \
-                .format("jdbc") \
-                .option("url", jdbc_url) \
-                .option("dbtable", "flight_data") \
-                .option("user", db_user) \
-                .option("password", db_password) \
-                .option("driver", "org.postgresql.Driver") \
-                .option("batchsize", "1000") \
-                .save()
+            _timed("postgres", lambda: batch_df.write
+                   .mode("append")
+                   .format("jdbc")
+                   .option("url", jdbc_url)
+                   .option("dbtable", "flight_data")
+                   .option("user", db_user)
+                   .option("password", db_password)
+                   .option("driver", "org.postgresql.Driver")
+                   .option("batchsize", "1000")
+                   .save())
 
-            ensure_index()
-            notify_flight_update()
+            _timed("ensure_index", ensure_index)
+            _timed("notify", notify_flight_update)
 
-            # MinIO 저장
-            batch_df.write \
-                .mode("append") \
-                .format("parquet") \
-                .save("s3a://flight-data-lake/raw_data")
-                
+            # MinIO 저장 (콜드 패스)
+            _timed("minio", lambda: batch_df.write
+                   .mode("append")
+                   .format("parquet")
+                   .save(COLD_PATH))
+
         except Exception as e:
             print(f"CRITICAL_SINK_ERROR: {e}")
-    
-    batch_df.unpersist()
+
+    _timed("unpersist", batch_df.unpersist)
+
+    # 예외로 중단됐어도 그 시점까지의 구간은 남긴다 — 어디서 끊겼는지가 곧 단서다.
+    print("SINK_METRIC " + json.dumps({
+        "batchId": batch_id,
+        "numRows": count,
+        "ms": timings,
+    }, default=str))
 
 # ---------------------------------------------------------------
 # A-1 (docs/EXPANSION_PLAN.md): 배치 메트릭 관측
@@ -196,11 +229,22 @@ def save_to_sinks(batch_df, batch_id):
 # StreamingQueryListener(py4j 콜백) 대신 폴링을 쓴 이유: 콜백 서버 설정 없이 동일한
 # 지표를 얻을 수 있고 실패 지점이 적다.
 #
-# lastProgress가 아니라 recentProgress(최근 N개 배치 배열, 기본 100)를 훑는다.
-# lastProgress 하나만 보면 폴링 간격 안에 배치가 두 개 끝났을 때 중간 배치가 조용히
-# 사라진다. 트리거 간격이 10초라 정상 상태에서는 문제가 없지만, 백로그를 소화하는
-# 동안 Spark는 트리거 간격을 무시하고 배치를 연달아 실행한다 — 즉 A-3(백프레셔)
-# 측정처럼 데이터가 가장 필요한 국면에서 하필 구멍이 난다.
+# 폴링은 lastProgress(1개)로 하고, 배치가 건너뛴 것이 감지됐을 때만 recentProgress로
+# 되메운다. 매초 recentProgress를 훑으면 안 되는 이유는 PySpark 3.5.0 구현 때문이다:
+#
+#   recentProgress → [json.loads(p.json()) for p in self._jsq.recentProgress()]  # 최대 100개
+#   lastProgress   → json.loads(self._jsq.lastProgress().json())                  # 1개
+#
+# 즉 매초 JVM이 progress 객체 100개를 JSON으로 직렬화하고 Python이 100개를 파싱한다
+# (분당 6,000회). 2026-09-09 이 방식을 배포한 뒤 24분 만에 addBatch가 3.7초→124초로
+# 악화되며 드라이버가 OOM으로 종료됐고, 직전 lastProgress 버전은 38분간 멀쩡했다.
+# 계측기가 관측 대상을 망가뜨리면 안 된다.
+#
+# 그래도 lastProgress '하나만' 보면 폴링 간격 안에 두 배치가 끝났을 때 중간 배치를
+# 놓친다. 트리거 간격이 10초라 정상 상태에서는 문제가 없지만, 백로그를 소화하는 동안
+# Spark는 트리거 간격을 무시하고 배치를 연달아 실행한다 — A-3(백프레셔) 측정처럼
+# 데이터가 가장 필요한 국면에서 하필 구멍이 난다. 그래서 간극이 보일 때만,
+# 그때 한 번 recentProgress를 읽어 되메운다.
 def start_metrics_reporter(query, interval_sec=1):
     def _emit(progress):
         sources = progress.get("sources") or [{}]
@@ -218,20 +262,34 @@ def start_metrics_reporter(query, interval_sec=1):
         last_emitted = -1
         while query.isActive:
             try:
-                pending = sorted(
-                    (p for p in (query.recentProgress or [])
-                     if p.get("batchId") is not None and p["batchId"] > last_emitted),
-                    key=lambda p: p["batchId"],
-                )
-                for progress in pending:
-                    batch_id = progress["batchId"]
-                    # recentProgress 버퍼(기본 100개)보다 빨리 배치가 지나가면 여기서도
-                    # 놓친다. 조용히 넘어가면 측정값이 완전한 것처럼 보이므로, 누락
-                    # 구간을 명시해 계측기가 자기 사각지대를 스스로 보고하게 한다.
-                    if last_emitted >= 0 and batch_id > last_emitted + 1:
-                        print(f"METRIC_GAP: batch {last_emitted + 1}~{batch_id - 1} 누락")
-                    _emit(progress)
-                    last_emitted = batch_id
+                progress = query.lastProgress
+                batch_id = progress.get("batchId") if progress else None
+
+                if batch_id is not None and batch_id > last_emitted:
+                    # 정상 경로: 바로 다음 배치이거나 첫 배치 → 비싼 호출 없이 끝낸다.
+                    if last_emitted < 0 or batch_id == last_emitted + 1:
+                        _emit(progress)
+                        last_emitted = batch_id
+                    else:
+                        # 건너뛴 배치가 있다. 이때만 recentProgress를 한 번 읽어 되메운다.
+                        backfill = sorted(
+                            (p for p in (query.recentProgress or [])
+                             if p.get("batchId") is not None
+                             and last_emitted < p["batchId"] <= batch_id),
+                            key=lambda p: p["batchId"],
+                        )
+                        recovered = {p["batchId"] for p in backfill}
+                        # recentProgress 버퍼(기본 100개)보다 빨리 지나간 구간은 되메울
+                        # 수 없다. 조용히 넘어가면 측정값이 완전한 것처럼 보이므로,
+                        # 계측기가 자기 사각지대를 스스로 보고하게 한다.
+                        missing = [b for b in range(last_emitted + 1, batch_id + 1)
+                                   if b not in recovered]
+                        if missing:
+                            # 불연속일 수 있으므로 범위로 뭉뚱그리지 않고 실제 목록을 낸다.
+                            print(f"METRIC_GAP: batch {missing} 누락 ({len(missing)}건)")
+                        for p in backfill:
+                            _emit(p)
+                        last_emitted = batch_id
             except Exception as e:
                 print(f"METRIC_WARNING: {e}")
             time.sleep(interval_sec)
