@@ -59,9 +59,16 @@ schema = StructType([
 # ---------------------------------------------------------------
 kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
-# failOnDataLoss=false: 체크포인트에 남은 오프셋이 Kafka retention(1시간)에 밀려 이미 삭제된
-# 경우, 기본값(true)이면 OffsetOutOfRangeException으로 스트림 자체가 죽는다. 스택을 한 시간 넘게
-# 꺼뒀다 다시 켜면 항상 재현되는 문제라, 유실분은 건너뛰고 남아있는 가장 이른 오프셋부터 이어가게 한다.
+# failOnDataLoss=false: 체크포인트가 가리키는 오프셋이 Kafka retention(1시간)에 밀려 이미
+# 삭제됐을 때, 기본값(true)은 OffsetOutOfRangeException으로 스트림 자체를 죽인다. 유실분은
+# 건너뛰고 남아있는 가장 이른 오프셋부터 이어가게 한다.
+#
+# 존재 근거가 2026-09-09에 바뀌었다. 원래는 "스택을 1시간 넘게 꺼뒀다 켜면 항상 재현"되는
+# 세션 '간' 문제 때문이었는데, 세션 시작 초기화(EXPANSION_PLAN 0.4)로 체크포인트와 Kafka가
+# 항상 함께 비워지므로 그 시나리오는 이제 발생하지 않는다. 남은 근거는 세션 '내'다 —
+# spark가 1시간 넘게 죽어 있는 동안 producer가 계속 쓰면 retention이 앞질러 간다.
+# 실제로 2026-09-09 OOM으로 spark가 장시간 내려간 적이 있으므로 가상의 경우가 아니다.
+#
 # (원본 이력은 MinIO 콜드 패스에 이미 보관되어 있으므로 여기서의 skip은 복구 불가능한 손실이 아니다.)
 df_raw = spark.readStream \
     .format("kafka") \
