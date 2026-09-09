@@ -6,7 +6,7 @@ import time
 
 import psycopg2
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, to_timestamp, from_unixtime
+from pyspark.sql.functions import from_json, col, to_timestamp, from_unixtime, date_format
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType, LongType, IntegerType
 
 # ---------------------------------------------------------------
@@ -158,11 +158,16 @@ def notify_flight_update():
 COLD_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/raw_data")
 
 
-def save_to_sinks(batch_df, batch_id):
-    # A-1은 "배치 시간의 78%가 addBatch"까지만 밝혔고, 그 안이 Postgres write와
-    # MinIO write 중 어디에 쏠려 있는지는 블랙박스로 남아 있었다. 두 구간을 각각
-    # 재서 SINK_METRIC으로 내보낸다. 이 비율이 나와야 다음 개선(두 싱크 병렬화 /
-    # 콜드 패스 분리 / JDBC 튜닝) 중 무엇이 실효가 있는지 예측하고 착수할 수 있다.
+def save_to_hot(batch_df, batch_id):
+    # 핫 패스(Postgres)만 담당한다. 콜드 패스(MinIO)는 별도 스트리밍 쿼리로 분리됐다.
+    #
+    # 분리 근거 (2026-09-09 실측, 184배치/200행, docs/BENCHMARKS.md):
+    #   count 746ms(50.7%) / minio 539ms(36.6%) / postgres 175ms(11.9%)
+    # MinIO가 Postgres의 3.1배였다. 두 싱크를 병렬화하면 539+175 → max(539,175)로
+    # 175ms만 줄지만, 콜드 패스를 배치 경로에서 빼면 539ms가 통째로 빠진다.
+    #
+    # count()는 남긴다. persist() 후 첫 액션이라 Kafka 읽기·JSON 파싱을 실제로
+    # 수행하는 구간이고, 없애면 그 비용이 Postgres 쓰기로 옮겨갈 뿐이다.
     timings = {}
 
     def _timed(name, fn):
@@ -199,12 +204,6 @@ def save_to_sinks(batch_df, batch_id):
 
             _timed("ensure_index", ensure_index)
             _timed("notify", notify_flight_update)
-
-            # MinIO 저장 (콜드 패스)
-            _timed("minio", lambda: batch_df.write
-                   .mode("append")
-                   .format("parquet")
-                   .save(COLD_PATH))
 
         except Exception as e:
             print(f"CRITICAL_SINK_ERROR: {e}")
@@ -245,10 +244,11 @@ def save_to_sinks(batch_df, batch_id):
 # Spark는 트리거 간격을 무시하고 배치를 연달아 실행한다 — A-3(백프레셔) 측정처럼
 # 데이터가 가장 필요한 국면에서 하필 구멍이 난다. 그래서 간극이 보일 때만,
 # 그때 한 번 recentProgress를 읽어 되메운다.
-def start_metrics_reporter(query, interval_sec=1):
+def start_metrics_reporter(query, label="hot", interval_sec=1):
     def _emit(progress):
         sources = progress.get("sources") or [{}]
         print("SPARK_METRIC " + json.dumps({
+            "query": label,
             "batchId": progress.get("batchId"),
             "timestamp": progress.get("timestamp"),
             "numInputRows": progress.get("numInputRows"),
@@ -286,7 +286,7 @@ def start_metrics_reporter(query, interval_sec=1):
                                    if b not in recovered]
                         if missing:
                             # 불연속일 수 있으므로 범위로 뭉뚱그리지 않고 실제 목록을 낸다.
-                            print(f"METRIC_GAP: batch {missing} 누락 ({len(missing)}건)")
+                            print(f"METRIC_GAP[{label}]: batch {missing} 누락 ({len(missing)}건)")
                         for p in backfill:
                             _emit(p)
                         last_emitted = batch_id
@@ -301,17 +301,47 @@ def start_metrics_reporter(query, interval_sec=1):
 # 6. 실행 (Checkpoint 관리)
 # ---------------------------------------------------------------
 checkpoint_dir = "/tmp/spark_checkpoints_final"
-if not os.path.exists(checkpoint_dir):
-    os.makedirs(checkpoint_dir)
+cold_checkpoint_dir = "/tmp/spark_checkpoints_cold"
+for d in (checkpoint_dir, cold_checkpoint_dir):
+    if not os.path.exists(d):
+        os.makedirs(d)
 
-query = df_processed.writeStream \
-    .foreachBatch(save_to_sinks) \
+# 핫 패스 — 서빙용. 10초 트리거를 유지해야 UI의 실시간성이 보장된다.
+hot_query = df_processed.writeStream \
+    .foreachBatch(save_to_hot) \
     .outputMode("append") \
     .trigger(processingTime="10 seconds") \
     .option("checkpointLocation", checkpoint_dir) \
     .start()
 
-start_metrics_reporter(query)
+# 콜드 패스 — 학습 데이터용. 핫 패스와 완전히 분리된 별도 쿼리다.
+#
+# 왜 분리했나: 같은 배치 안에서 순차로 쓰던 구조에서 MinIO가 Postgres의 3.1배를
+# 먹고 있었다(539ms vs 175ms). 분리하면 그 539ms가 핫 패스 배치에서 통째로 빠진다.
+#
+# 왜 트리거가 긴가: 콜드 패스는 아무도 실시간으로 조회하지 않는다(B-2 학습 데이터
+# 원천). 10초마다 쓰면 하루 8,600개의 작은 Parquet이 생기는데, 300초로 늘리면
+# 파일이 30배 적고 30배 커진다 — 학습 데이터 로딩에서 소파일 문제가 완화된다.
+#
+# 왜 partitionBy("dt")인가: 2026-09-09 데이터 수명 정책(0.4)에서 MinIO가 유일한
+# 영구 저장소로 확정됐다. 평면 경로로는 (1) A-2 순서 수정 이전/이후 데이터를
+# 구분할 수 없고 (2) 학습 시 기간을 골라 읽을 수 없다.
+#
+# 대가: Kafka를 두 번 읽는다(쿼리마다 독립 컨슈머). 현재 트래픽에서는 무시할 수
+# 있지만, B-1 지리 확장 시 재검토가 필요하다.
+cold_query = df_processed \
+    .withColumn("dt", date_format(col("timestamp"), "yyyy-MM-dd")) \
+    .writeStream \
+    .format("parquet") \
+    .outputMode("append") \
+    .partitionBy("dt") \
+    .option("path", COLD_PATH) \
+    .option("checkpointLocation", cold_checkpoint_dir) \
+    .trigger(processingTime=os.getenv("COLD_TRIGGER", "300 seconds")) \
+    .start()
+
+start_metrics_reporter(hot_query, label="hot")
+start_metrics_reporter(cold_query, label="cold")
 
 print("TACTICAL_ETL_SYSTEM: OPERATIONAL")
-query.awaitTermination()
+hot_query.awaitTermination()

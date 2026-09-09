@@ -124,11 +124,23 @@ services:
       # 테스트 시에만 경로를 덮어쓴다:
       #   MINIO_COLD_PATH=s3a://flight-data-lake/synthetic docker compose up -d spark
       - MINIO_COLD_PATH=${MINIO_COLD_PATH:-s3a://flight-data-lake/raw_data}
+      # 콜드 패스 트리거 간격. 핫 패스(10초)와 분리돼 있어 길게 잡을수록
+      # Parquet 파일이 크고 적게 생긴다 (300초 = 배치당 30배 적은 파일).
+      - COLD_TRIGGER=${COLD_TRIGGER:-300 seconds}
+    # 2026-09-09 spark가 OOMKilled(exit 137)로 죽었는데, 한도가 없어서 "spark 자체가
+    # 자란 것"인지 "Docker VM 전체가 압박받은 것"인지 구분할 수 없었다. 한도를 명시해야
+    # OOM이 재현 가능하고 귀속 가능한 사건이 된다. 실측 최대치가 1,213MiB(20배 부하,
+    # 30분)였으므로 여유를 두고 2g. 이 값을 넘겨 죽으면 원인이 spark로 특정된다.
+    mem_limit: 2g
     volumes:
       - ./src:/opt/airflow/src
       # 컨테이너 재시작 시 체크포인트가 유실되면 Kafka earliest offset부터 전체 재처리되어
       # 이미 적재된 데이터가 중복 저장됨 - 호스트에 마운트해서 재시작 간 이어서 처리되게 함
       - ./checkpoints/spark_checkpoints_final:/tmp/spark_checkpoints_final
+      # 콜드 패스는 별도 스트리밍 쿼리라 체크포인트도 따로다. 마운트하지 않으면
+      # spark 재시작 때마다 Kafka earliest부터 다시 읽어 학습 데이터에 중복이 쌓인다
+      # (핫 패스가 2026-08-20에 겪은 것과 같은 문제).
+      - ./checkpoints/spark_checkpoints_cold:/tmp/spark_checkpoints_cold
     depends_on:
       kafka:
         condition: service_started
