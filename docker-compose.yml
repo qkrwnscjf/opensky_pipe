@@ -34,9 +34,57 @@ services:
       # Phase 1 (docs/EXPANSION_PLAN.md): 새로 생성되는 토픽의 기본 파티션 수. 이미 존재하는
       # flight_data_raw 토픽에는 소급 적용되지 않으므로, 기존 토픽은 `kafka-topics --alter`로 늘려야 함.
       KAFKA_NUM_PARTITIONS: 6
-      KAFKA_LOG_RETENTION_HOURS: 1 
+      # retention 1 → 3시간 (2026-09-10, A-3 하위 항목 재검토).
+      #
+      # 존재 근거가 Phase 1-2에서 바뀌었다. 원래는 "체크포인트가 retention보다 오래
+      # 살아남는" 세션 '간' 문제와 얽혀 있었는데, 세션 시작 초기화로 체크포인트와
+      # Kafka가 항상 함께 비워지므로 그 축은 사라졌다.
+      #
+      # 지금 이 값이 결정하는 건 하나뿐이다 — 세션 '내' spark 다운타임을 얼마나
+      # 견디는가. 이를 넘기면 콜드 패스(B-2 학습 데이터)에 **영구적인 구멍**이 생긴다.
+      #
+      # 1시간이 위험한 시나리오가 실제로 있었다: 익명 볼륨 소유권 버그로 spark가
+      # 크래시 루프에 빠져 11분간 RestartCount 43을 기록했다(2026-09-09).
+      # restart: unless-stopped로 단발 크래시는 몇 분 안에 복구되지만 루프는 다르다.
+      #
+      # 비용은 실측 기준 시간당 약 14MB이므로 3시간이면 세션당 약 42MB.
+      # Kafka 데이터는 세션마다 초기화돼 누적되지 않는다. 부족하면 더 늘린다.
+      KAFKA_LOG_RETENTION_HOURS: 3
+      # 파티션당 상한(백스톱). 현재 파티션당 약 2.3MB/시간이라 시간 조건이 먼저
+      # 걸린다. B-1로 트래픽이 수십 배가 되면 이쪽이 병목이 되므로 재산정 필요.
       KAFKA_LOG_RETENTION_BYTES: 536870912  # 512MB
       KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+
+  # 2.5 Kafka 토픽 사전 생성 (minio-init과 같은 패턴)
+  #
+  # 없으면 파이프라인이 아예 못 뜨는 경우가 있다. Phase 1-2 세션 초기화로 Kafka는
+  # 매 세션 토픽 0개로 시작하는데, 토픽은 producer가 첫 메시지를 보낼 때 자동
+  # 생성된다. 그래서 producer가 OpenSky에 접근하지 못하면(429 일일 한도 소진,
+  # API 장애, 네트워크 단절) 토픽이 영영 안 만들어지고, spark가 없는 토픽을
+  # 구독하다 UnknownTopicOrPartitionException으로 죽는다.
+  # restart: unless-stopped가 붙어 있어 그대로 크래시 루프가 된다.
+  # (2026-09-10 실제 발생 — 429 상태에서 세션을 재시작하다 재현)
+  #
+  # Phase 1-2 이전에는 Kafka 데이터가 바인드 마운트라 토픽이 세션을 넘어 살아남아
+  # 드러나지 않던 문제다. 하드 제약 0.1("docker compose up 한 번으로 자동 기동")을
+  # 지키려면 수집 소스의 상태와 무관하게 토픽이 있어야 한다.
+  #
+  # 파티션 수를 여기서 명시하는 것이 브로커 기본값(KAFKA_NUM_PARTITIONS)에
+  # 의존하는 것보다 낫다 — 자동 생성 시점의 기본값에 좌우되지 않는다.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: >
+      /bin/sh -c "
+      until kafka-broker-api-versions --bootstrap-server kafka:29092 > /dev/null 2>&1; do
+        echo 'Waiting for kafka...'; sleep 2;
+      done;
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic flight_data_raw --partitions 6 --replication-factor 1;
+      kafka-topics --bootstrap-server kafka:29092 --describe --topic flight_data_raw;
+      exit 0;
+      "
 
   # 3. MinIO (New! - AWS S3 역할을 하는 저장소)
   minio:
@@ -162,6 +210,8 @@ services:
     depends_on:
       kafka:
         condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_started
       minio-init:
