@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import select
 import threading
@@ -119,15 +120,24 @@ _ws_clients: set[WebSocket] = set()
 
 
 async def _broadcast_flights():
-    payload = jsonable_encoder(fetch_flights())
-    dead = []
-    for ws in list(_ws_clients):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        _ws_clients.discard(ws)
+    # A-4 (docs/EXPANSION_PLAN.md): 직렬화는 한 번만 한다.
+    #
+    # send_json(payload)은 호출될 때마다 payload를 JSON으로 직렬화한다. 모든
+    # 클라이언트에게 '같은' 데이터를 보내는데도 클라이언트 수만큼 같은 일을
+    # 반복하던 구조였다. 한 번 dumps한 문자열을 send_text로 돌려쓴다.
+    payload = json.dumps(jsonable_encoder(fetch_flights()))
+
+    # 순차 await도 함께 고쳤다. 느린 클라이언트 하나가 뒤의 모두를 막고 있었다.
+    # gather로 동시에 보내고, 예외는 개별로 회수해 죽은 연결만 정리한다.
+    clients = list(_ws_clients)
+    if not clients:
+        return
+    results = await asyncio.gather(
+        *(ws.send_text(payload) for ws in clients), return_exceptions=True
+    )
+    for ws, result in zip(clients, results):
+        if isinstance(result, Exception):
+            _ws_clients.discard(ws)
 
 
 def _listen_for_notifications(loop: asyncio.AbstractEventLoop):

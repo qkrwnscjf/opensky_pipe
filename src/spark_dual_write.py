@@ -135,21 +135,49 @@ def ensure_index():
 # Phase 2 (docs/EXPANSION_PLAN.md): 배치가 Postgres에 성공적으로 쓰인 직후 호출.
 # src/backend/main.py가 `LISTEN flight_update`로 대기하다가 이 신호를 받으면
 # 연결된 WebSocket 클라이언트에 최신 /flights 결과를 브로드캐스트한다.
+# A-4: 커넥션을 배치마다 새로 열지 않고 재사용한다.
+#
+# 이전에는 배치마다 connect → pg_notify → close를 반복했다. 한 번이 10~15ms로
+# 크진 않지만, 그 비용이 배치 경로 '안'에 있고 TCP 핸드셰이크와 Postgres 백엔드
+# 프로세스 생성을 매번 유발한다. 트리거를 3초로 줄인 뒤(A-5) 호출 빈도가 늘어
+# 더 아깝게 됐다.
+#
+# 커넥션은 끊길 수 있으므로(Postgres 재시작, 유휴 타임아웃) 실패하면 한 번
+# 버리고 다시 연결한다 — 재사용이 '끊기면 알림을 잃는' 구조가 되면 안 된다.
+_notify_conn = None
+
+
+def _open_notify_conn():
+    conn = psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname=os.getenv("DB_NAME", "flightdb"),
+        user=os.getenv("DB_USER", "myuser"),
+        password=os.getenv("DB_PASSWORD", "mypassword"),
+    )
+    conn.autocommit = True
+    return conn
+
+
 def notify_flight_update():
-    try:
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=os.getenv("DB_PORT", "5432"),
-            dbname=os.getenv("DB_NAME", "flightdb"),
-            user=os.getenv("DB_USER", "myuser"),
-            password=os.getenv("DB_PASSWORD", "mypassword"),
-        )
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_notify('flight_update', '')")
-        conn.close()
-    except Exception as e:
-        print(f"NOTIFY_WARNING: {e}")
+    global _notify_conn
+    for attempt in (1, 2):
+        try:
+            if _notify_conn is None or _notify_conn.closed:
+                _notify_conn = _open_notify_conn()
+            with _notify_conn.cursor() as cur:
+                cur.execute("SELECT pg_notify('flight_update', '')")
+            return
+        except Exception as e:
+            # 1차 실패는 끊긴 커넥션일 가능성이 높다. 버리고 한 번만 재시도한다.
+            try:
+                if _notify_conn is not None:
+                    _notify_conn.close()
+            except Exception:
+                pass
+            _notify_conn = None
+            if attempt == 2:
+                print(f"NOTIFY_WARNING: {e}")
 
 
 # 콜드 패스 적재 경로. 기본값이 실데이터 경로이고, 합성 부하 테스트일 때만 덮어쓴다.
