@@ -6,7 +6,10 @@ import time
 
 import psycopg2
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, to_timestamp, from_unixtime, date_format
+from pyspark.sql.functions import (
+    from_json, col, to_timestamp, from_unixtime, date_format,
+    count as _count, sum as _sum, when, lit,
+)
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType, LongType, IntegerType
 
 from flight_schema import FLIGHT_FIELDS
@@ -98,11 +101,31 @@ df_raw = spark.readStream \
 df_parsed = df_raw.select(from_json(col("value").cast("string"), schema).alias("data")).select("data.*")
 
 # timestamp(Long)를 timestamp_ts(Timestamp)로 변환 후, 원래의 timestamp 컬럼을 대체
-df_processed = df_parsed \
+#
+# 유효성 판정을 '필터'가 아니라 '_valid 플래그'로 바꿨다 (2026-09-11).
+# 이전에는 filter가 조용히 버렸다. 그게 위험한 이유:
+#  - from_json이 스키마와 안 맞으면 예외가 아니라 **전 필드 null**인 행이 된다.
+#    그러면 좌표도 null이라 같은 필터에 걸려 사라진다 → 스키마가 어긋나면
+#    데이터가 전량 조용히 증발하는데 파이프라인은 정상으로 보인다.
+#    2026-09-10에 실제로 스키마 드리프트를 겪었고(3필드 × 30,528행 null) 그때도 조용했다.
+#  - timestamp가 null이면 dt도 null이 되어 dt=__HIVE_DEFAULT_PARTITION__에 적재된다.
+#    날짜 파티션 정확성이 콜드 패스의 유일한 요구사항이므로 직접적인 위협이다.
+#
+# 그래서 timestamp null도 유효성 조건에 넣고, 드롭을 save_to_hot에서 사유별로 센다.
+df_flagged = df_parsed \
     .withColumn("timestamp_fixed", to_timestamp(from_unixtime(col("timestamp")))) \
     .drop("timestamp") \
     .withColumnRenamed("timestamp_fixed", "timestamp") \
-    .filter(col("latitude").isNotNull() & col("longitude").isNotNull())
+    .withColumn(
+        "_valid",
+        col("latitude").isNotNull()
+        & col("longitude").isNotNull()
+        & col("timestamp").isNotNull(),
+    )
+
+# 콜드 패스는 네이티브 parquet 싱크라 foreachBatch가 없어 셀 수 없다. 카운트는
+# 핫 패스에서만 하되, 두 쿼리가 같은 소스를 보므로 그 수치가 콜드에도 그대로 해당한다.
+df_processed = df_flagged.filter(col("_valid")).drop("_valid")
 
 # ---------------------------------------------------------------
 # 5. 핵심 함수: 배치 처리 로직 (Dual Write)
@@ -227,7 +250,42 @@ def save_to_hot(batch_df, batch_id):
             timings[name] = round((time.perf_counter() - started) * 1000, 1)
 
     batch_df.persist()
-    count = _timed("count", batch_df.count)
+
+    # 기존 count() 자리를 단일 agg로 대체한다 — 액션 수는 그대로 1회이므로
+    # 드롭 카운트가 공짜로 붙는다. count()가 배치의 50.7%를 차지한다는 실측이
+    # 있어(2026-09-10) 액션을 늘리지 않는 것이 중요했다.
+    #
+    # 사유를 나누는 이유: 총계만으로는 "좌표 없는 정상 레코드"와 "스키마가 어긋나
+    # 파싱이 통째로 실패한 레코드"를 구분할 수 없다. 후자는 파이프라인 결함이다.
+    stats = _timed("count", lambda: batch_df.agg(
+        _count(lit(1)).alias("total"),
+        _sum(when(col("_valid"), 1).otherwise(0)).alias("valid"),
+        # icao24까지 null이면 레코드 자체가 파싱되지 않았을 가능성이 크다.
+        _sum(when(col("icao24").isNull(), 1).otherwise(0)).alias("unparsed"),
+        _sum(when(col("icao24").isNotNull()
+                  & (col("latitude").isNull() | col("longitude").isNull()),
+                  1).otherwise(0)).alias("no_coord"),
+        _sum(when(col("icao24").isNotNull() & col("timestamp").isNull(),
+                  1).otherwise(0)).alias("no_time"),
+    ).collect()[0])
+
+    total = stats["total"] or 0
+    count = stats["valid"] or 0
+    dropped = total - count
+
+    if dropped:
+        # 발생했을 때만 남긴다. 정상일 때 0을 계속 찍으면 아무도 읽지 않게 된다.
+        print(f"DROP_WARNING: {dropped}/{total}건 제외 "
+              f"(파싱실패 {stats['unparsed'] or 0}, 좌표없음 {stats['no_coord'] or 0}, "
+              f"시각없음 {stats['no_time'] or 0}) — batch {batch_id}")
+        if stats["unparsed"] and stats["unparsed"] == total:
+            # 전량이 파싱 실패면 스키마 드리프트를 의심해야 한다. 조용히 넘기면
+            # 파이프라인은 정상으로 보이면서 레이크가 비어간다.
+            print("DROP_WARNING: 배치 전량이 파싱 실패입니다 — "
+                  "src/flight_schema.py와 실제 메시지 스키마가 어긋났는지 확인하세요.")
+
+    # 이후 쓰기 경로는 유효 레코드만 다룬다.
+    batch_df = batch_df.filter(col("_valid")).drop("_valid")
 
     if count > 0:
         print(f"[{batch_id}] {count} records processing...")
@@ -263,6 +321,7 @@ def save_to_hot(batch_df, batch_id):
     print("SINK_METRIC " + json.dumps({
         "batchId": batch_id,
         "numRows": count,
+        "numDropped": dropped,
         "ms": timings,
     }, default=str))
 
@@ -390,7 +449,9 @@ for d in (checkpoint_dir, cold_checkpoint_dir):
 # 이 값이 줄이는 것은 'Kafka에 도착한 레코드가 처리될 때까지의 대기'다. producer
 # 폴링 주기(10초)는 건드리지 않는다 — 줄이면 OpenSky 크레딧 소모가 늘고 실제로
 # 2026-09-09에 429(일일 한도 소진)를 겪었다.
-hot_query = df_processed.writeStream \
+# 핫 쿼리는 df_flagged(_valid 포함)를 받는다 — save_to_hot이 드롭을 세고 나서
+# 직접 필터링한다. 콜드 쿼리는 이미 걸러진 df_processed를 쓴다.
+hot_query = df_flagged.writeStream \
     .foreachBatch(save_to_hot) \
     .outputMode("append") \
     .trigger(processingTime=os.getenv("HOT_TRIGGER", "3 seconds")) \
