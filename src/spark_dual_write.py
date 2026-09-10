@@ -434,6 +434,41 @@ for d in (checkpoint_dir, cold_checkpoint_dir):
     if not os.path.exists(d):
         os.makedirs(d)
 
+
+def warn_if_checkpoint_lost():
+    """체크포인트가 비어 있는데 Kafka에 데이터가 있으면 알린다.
+
+    체크포인트가 비는 경우는 실측으로 확인한 결과 **세션 시작(down 후 up)**과
+    `up --renew-anon-volumes`뿐이다. 2026-09-11 검증: `up -d --force-recreate spark`로
+    컨테이너를 새로 만들어도(ID가 바뀜) 익명 볼륨은 그대로 재사용돼 커밋 19건이
+    살아남았다 — Docker Compose는 재생성 시 익명 볼륨을 보존한다.
+
+    체크포인트가 실제로 비면 Kafka를 earliest부터 다시 읽는다. 콜드 패스의
+    재기록분은 _spark_metadata에 커밋되지 않아 **데이터가 오염되지는 않지만**
+    (2026-09-10 실측: 커밋된 집합 중복 0%) 불필요한 재처리가 일어난다.
+
+    막지는 못하더라도 드러나게 한다 — 이 프로젝트에서 반복해 값어치를 확인한
+    접근이다(NULL_KEY_WARNING, METRIC_GAP, 콜드 기아 경고).
+    """
+    try:
+        for label, path in (("hot", checkpoint_dir), ("cold", cold_checkpoint_dir)):
+            commits = os.path.join(path, "commits")
+            has_commit = os.path.isdir(commits) and any(
+                f.isdigit() for f in os.listdir(commits)
+            )
+            if not has_commit:
+                print(f"CHECKPOINT_FRESH[{label}]: 커밋 이력이 없습니다 — "
+                      f"세션 시작이거나 컨테이너가 재생성됐습니다. "
+                      f"후자라면 Kafka를 earliest부터 재처리하며 콜드 패스에 "
+                      f"고아 파일이 쌓입니다(데이터 무결성은 유지). "
+                      f"세션 중에는 `docker compose restart spark`를 쓰세요.")
+    except Exception as e:
+        # 경고 로직이 스트림 기동을 막아서는 안 된다.
+        print(f"CHECKPOINT_CHECK_WARNING: {e}")
+
+
+warn_if_checkpoint_lost()
+
 # 핫 패스 — 서빙용.
 #
 # 트리거를 10초 → 3초로 줄였다 (A-5, 2026-09-10). 이전에는 줄일 수 없었다:
