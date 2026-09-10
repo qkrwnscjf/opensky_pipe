@@ -60,9 +60,22 @@ else:
 # (2026-08-20 실측: 정상 동작 중에도 3분당 수십 쌍씩 누적 — docs/BENCHMARKS.md 참고)
 _last_snapshot_time = None
 
+# icao24가 없는 레코드는 key_serializer가 None을 돌려주어 라운드로빈으로 '안전하게'
+# 강등된다 — 예외로 수집이 끊기지 않는다. 문제는 그게 **조용하다**는 것이다.
+#
+# 강등된 레코드는 기체별 순서 보장(A-2)에서 빠지고, 그대로 콜드 패스에 실려
+# B-2 학습 데이터에 섞인다. 시퀀스 순서가 곧 라벨인데 순서가 깨진 레코드가
+# 표시 없이 들어가는 셈이다. 스키마가 바뀌어 icao24 필드명이 달라지기라도 하면
+# 전량이 조용히 강등되는데 아무도 모른다.
+#
+# 그래서 센다. 로그는 폴링마다가 아니라 '발생했을 때만' 남긴다 — 정상일 때
+# 0을 계속 찍으면 아무도 읽지 않게 되고, 그러면 카운터가 있으나 마나다.
+_null_key_total = 0
+
 
 def fetch_and_send():
-    global _last_snapshot_time
+    global _last_snapshot_time, _null_key_total
+    null_key_batch = 0
     try:
         response = session.get(URL, params=PARAMS, timeout=10)
         response.raise_for_status()
@@ -88,8 +101,16 @@ def fetch_and_send():
             # 흩어져 기체별 시간 순서가 깨진다. (2026-09-09 실측: 2회 이상 등장한
             # 기체의 94.7%가 복수 파티션에 분산 — docs/BENCHMARKS.md 참고)
             # 콜드 패스를 궤적 예측 학습 데이터로 쓸 때 시퀀스 순서가 곧 라벨이다.
+            if not flight_info["icao24"]:
+                _null_key_total += 1
+                null_key_batch += 1
             producer.send('flight_data_raw', key=flight_info["icao24"], value=flight_info)
-        
+
+        if null_key_batch:
+            print(f"NULL_KEY_WARNING: icao24 없는 레코드 {null_key_batch}건을 "
+                  f"키 없이(라운드로빈) 전송했습니다 — 기체별 순서 보장에서 제외됨. "
+                  f"누적 {_null_key_total}건")
+
         producer.flush() # 메시지 전송 보장
         # flush 성공 후에만 갱신 — 전송에 실패했다면 다음 주기에 같은 스냅샷을 다시 시도해야 한다.
         _last_snapshot_time = snapshot_time

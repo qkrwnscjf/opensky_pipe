@@ -53,8 +53,10 @@ def build_record(state, snapshot_time):
             record[name] = state[idx] if idx < len(state) else None
 
     # callsign은 공백 패딩이 붙어 오고 빈 문자열도 흔하다.
+    # isinstance로 거르는 이유: 예상 못 한 타입이 오면 .strip()에서 예외가 나고,
+    # 그 예외가 폴링 주기 전체를 날린다 — 레코드 하나 때문에 100대분이 버려진다.
     callsign = record.get("callsign")
-    record["callsign"] = callsign.strip() if callsign else "N/A"
+    record["callsign"] = callsign.strip() if isinstance(callsign, str) and callsign.strip() else "N/A"
 
     # sensors는 배열로 오는데 스키마상 문자열이다. 익명 티어에서는 거의 null.
     sensors = record.get("sensors")
