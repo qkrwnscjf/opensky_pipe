@@ -1,6 +1,7 @@
 import requests
 import json
 import os
+from flight_schema import build_record
 from kafka import KafkaProducer
 from datetime import datetime
 import time
@@ -78,23 +79,10 @@ def fetch_and_send():
 
         states = data['states']
         for state in states:
-            flight_info = {
-                "icao24": state[0],
-                "callsign": state[1].strip() if state[1] else "N/A",
-                "origin_country": state[2],
-                "time_position": state[3],
-                "last_contact": state[4],
-                "longitude": state[5],
-                "latitude": state[6],
-                "baro_altitude": state[7],
-                "on_ground": state[8],
-                "velocity": state[9],
-                "true_track": state[10],
-                "vertical_rate": state[11],
-                "geo_altitude": state[13],
-                "squawk": state[14],
-                "timestamp": data['time']
-            }
+            # 필드 정의와 변환 규칙은 src/flight_schema.py 한 곳에만 있다.
+            # 여기에 dict를 직접 쓰면 Spark의 StructType과 또 갈라진다
+            # (2026-09-10 실측: 3개 필드가 30,528행 전부 null이었다).
+            flight_info = build_record(state, data['time'])
             # icao24를 파티션 키로 사용 — Kafka는 파티션 '내부' 순서만 보장하므로,
             # 키 없이 보내면 라운드로빈으로 같은 기체의 연속 위치가 6개 파티션에
             # 흩어져 기체별 시간 순서가 깨진다. (2026-09-09 실측: 2회 이상 등장한

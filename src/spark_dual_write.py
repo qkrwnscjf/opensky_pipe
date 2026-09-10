@@ -9,6 +9,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, to_timestamp, from_unixtime, date_format
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType, LongType, IntegerType
 
+from flight_schema import FLIGHT_FIELDS
+
 # ---------------------------------------------------------------
 # 1. Spark 세션 생성
 # ---------------------------------------------------------------
@@ -33,25 +35,19 @@ spark.sparkContext.setLogLevel("WARN")
 # ---------------------------------------------------------------
 # 2. 스키마 정의 (Kafka에서 들어오는 raw JSON 형태)
 # ---------------------------------------------------------------
+# 스키마는 src/flight_schema.py에서만 정의한다. 여기에 StructType을 직접 쓰면
+# producer의 dict와 갈라진다 — 실제로 그랬다 (2026-09-10: 선언은 18필드인데
+# producer는 15개만 보내 sensors/spi/position_source가 30,528행 전부 null).
+_SPARK_TYPES = {
+    "string": StringType,
+    "long": LongType,
+    "double": DoubleType,
+    "boolean": BooleanType,
+    "int": IntegerType,
+}
 schema = StructType([
-    StructField("icao24", StringType()),
-    StructField("callsign", StringType()),
-    StructField("origin_country", StringType()),
-    StructField("time_position", LongType()),
-    StructField("last_contact", LongType()),
-    StructField("longitude", DoubleType()),
-    StructField("latitude", DoubleType()),
-    StructField("baro_altitude", DoubleType()),
-    StructField("on_ground", BooleanType()),
-    StructField("velocity", DoubleType()),
-    StructField("true_track", DoubleType()),
-    StructField("vertical_rate", DoubleType()),
-    StructField("sensors", StringType()),
-    StructField("geo_altitude", DoubleType()),
-    StructField("squawk", StringType()),
-    StructField("spi", BooleanType()),
-    StructField("position_source", IntegerType()),
-    StructField("timestamp", LongType()) # Raw epoch timestamp
+    StructField(name, _SPARK_TYPES[type_name]())
+    for name, type_name, _ in FLIGHT_FIELDS
 ])
 
 # ---------------------------------------------------------------
