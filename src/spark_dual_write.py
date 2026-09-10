@@ -70,12 +70,30 @@ kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 # 실제로 2026-09-09 OOM으로 spark가 장시간 내려간 적이 있으므로 가상의 경우가 아니다.
 #
 # (원본 이력은 MinIO 콜드 패스에 이미 보관되어 있으므로 여기서의 skip은 복구 불가능한 손실이 아니다.)
+# maxOffsetsPerTrigger (A-3): 한 트리거가 가져올 수 있는 오프셋 수 상한.
+#
+# 없으면 다운타임 뒤 재기동할 때 밀린 물량을 한 배치에 전부 삼킨다. 2026-09-10 실측:
+# spark를 5분 멈췄다 켜니 첫 배치가 **2,742행**이었다 — 정상(95행)의 29배, 7.9초.
+# 과거에도 761·945행 스파이크가 관측됐다. 배치가 커지면 persist()가 붙들 메모리가
+# 그만큼 커지므로 A-4(메모리)와 직결되고, 처리 시간이 트리거를 넘겨 지연이 쌓인다.
+#
+# 500을 고른 근거는 실측이다 (2026-09-10, 실트래픽):
+#   정상 배치 p50 87행 / max 91행, producer 1회 전송 83행
+# 평상시를 절대 조이지 않으려면 정상 max보다 충분히 커야 하고(5.5배 여유), 동시에
+# 위 스파이크는 잘라야 한다. 임의값이 아니라 이 두 조건의 교집합이다.
+#
+# 소스에 걸었으므로 핫·콜드 두 쿼리 모두에 적용된다 — 메모리 안전 관점에서는
+# 그게 맞다. 다만 콜드 패스는 백로그 구간에서 파일이 더 잘게 쪼개진다.
+#
+# B-1(아시아 확장)으로 트래픽이 수십 배가 되면 이 값이 평상시를 조이게 되므로
+# 반드시 재산정해야 한다. KAFKA_MAX_OFFSETS 환경변수로 조정 가능.
 df_raw = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", kafka_bootstrap) \
     .option("subscribe", "flight_data_raw") \
     .option("startingOffsets", "earliest") \
     .option("failOnDataLoss", "false") \
+    .option("maxOffsetsPerTrigger", os.getenv("KAFKA_MAX_OFFSETS", "500")) \
     .load()
 
 # ---------------------------------------------------------------
@@ -275,10 +293,22 @@ def save_to_hot(batch_df, batch_id):
 # 계측기가 관측 대상을 망가뜨리면 안 된다.
 #
 # 그래도 lastProgress '하나만' 보면 폴링 간격 안에 두 배치가 끝났을 때 중간 배치를
-# 놓친다. 트리거 간격이 10초라 정상 상태에서는 문제가 없지만, 백로그를 소화하는 동안
-# Spark는 트리거 간격을 무시하고 배치를 연달아 실행한다 — A-3(백프레셔) 측정처럼
-# 데이터가 가장 필요한 국면에서 하필 구멍이 난다. 그래서 간극이 보일 때만,
-# 그때 한 번 recentProgress를 읽어 되메운다.
+# 놓친다. 그래서 batchId가 건너뛴 것이 보일 때만 recentProgress를 한 번 읽어 되메운다.
+#
+# 【2026-09-10 정정】 원래 이 방어의 근거로 "백로그를 소화하는 동안 Spark가 트리거
+# 간격을 무시하고 배치를 연달아 실행한다"고 적었는데, **틀렸다.** A-3 백프레셔 검증
+# 중 실측한 결과 5분치 백로그를 소화하는 구간에서도 배치 완료 간격이 정확히 3.00초
+# — 트리거 간격 그대로였다. processingTime 트리거는 백로그가 있어도 페이스를 지킨다
+# (배치가 트리거를 넘겨야만 다음 배치가 곧바로 시작된다).
+#
+# 따라서 현재 설정(3초 트리거)에서 '폴링 간격 안에 두 배치'는 사실상 일어나지 않는다.
+# 이 방어를 남겨두는 이유는 트리거를 1초 미만으로 낮추거나 Trigger.AvailableNow처럼
+# 페이싱이 없는 모드로 바꿀 때를 위한 것이며, 비용이 0에 가까우므로 유지한다.
+#
+# 첫 폴링에서는 recentProgress로 되메운다. 그러지 않으면 리포터가 뜨기 전에 끝난
+# 배치가 조용히 사라진다 — 2026-09-10 실측: 재기동 후 batch 191이 SINK_METRIC에는
+# 있는데 SPARK_METRIC에는 없었고 METRIC_GAP도 뜨지 않았다. 기동 시 1회뿐이라
+# 비싼 호출을 해도 된다. (첫 폴링에는 비교 기준이 없으므로 간극 보고는 하지 않는다.)
 def start_metrics_reporter(query, label="hot", interval_sec=1):
     def _emit(progress):
         sources = progress.get("sources") or [{}]
@@ -301,12 +331,14 @@ def start_metrics_reporter(query, label="hot", interval_sec=1):
                 batch_id = progress.get("batchId") if progress else None
 
                 if batch_id is not None and batch_id > last_emitted:
-                    # 정상 경로: 바로 다음 배치이거나 첫 배치 → 비싼 호출 없이 끝낸다.
-                    if last_emitted < 0 or batch_id == last_emitted + 1:
+                    first_poll = last_emitted < 0
+                    if not first_poll and batch_id == last_emitted + 1:
+                        # 정상 경로: 바로 다음 배치 → 비싼 호출 없이 끝낸다.
                         _emit(progress)
                         last_emitted = batch_id
                     else:
-                        # 건너뛴 배치가 있다. 이때만 recentProgress를 한 번 읽어 되메운다.
+                        # 첫 폴링이거나 batchId가 건너뛰었다. 이때만 recentProgress를
+                        # 한 번 읽어 되메운다.
                         backfill = sorted(
                             (p for p in (query.recentProgress or [])
                              if p.get("batchId") is not None
@@ -314,15 +346,21 @@ def start_metrics_reporter(query, label="hot", interval_sec=1):
                             key=lambda p: p["batchId"],
                         )
                         recovered = {p["batchId"] for p in backfill}
-                        # recentProgress 버퍼(기본 100개)보다 빨리 지나간 구간은 되메울
-                        # 수 없다. 조용히 넘어가면 측정값이 완전한 것처럼 보이므로,
-                        # 계측기가 자기 사각지대를 스스로 보고하게 한다.
-                        missing = [b for b in range(last_emitted + 1, batch_id + 1)
-                                   if b not in recovered]
-                        if missing:
-                            # 불연속일 수 있으므로 범위로 뭉뚱그리지 않고 실제 목록을 낸다.
-                            print(f"METRIC_GAP[{label}]: batch {missing} 누락 ({len(missing)}건)")
-                        for p in backfill:
+                        # 첫 폴링에는 "직전에 무엇이 있었어야 하는지"의 기준이 없다.
+                        # 체크포인트에서 이어받은 batchId는 0부터 시작하지 않으므로,
+                        # 여기서 간극을 계산하면 전부 누락으로 오보한다.
+                        if not first_poll:
+                            # recentProgress 버퍼(기본 100개)보다 빨리 지나간 구간은
+                            # 되메울 수 없다. 조용히 넘어가면 측정값이 완전한 것처럼
+                            # 보이므로, 계측기가 자기 사각지대를 스스로 보고하게 한다.
+                            missing = [b for b in range(last_emitted + 1, batch_id + 1)
+                                       if b not in recovered]
+                            if missing:
+                                # 불연속일 수 있으므로 범위로 뭉뚱그리지 않고 목록을 낸다.
+                                print(f"METRIC_GAP[{label}]: batch {missing} 누락 "
+                                      f"({len(missing)}건)")
+                        # recentProgress가 비어 있어도 lastProgress만은 남긴다.
+                        for p in (backfill or [progress]):
                             _emit(p)
                         last_emitted = batch_id
             except Exception as e:
