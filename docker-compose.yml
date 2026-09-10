@@ -184,9 +184,21 @@ services:
       # 테스트 시에만 경로를 덮어쓴다:
       #   MINIO_COLD_PATH=s3a://flight-data-lake/synthetic docker compose up -d spark
       - MINIO_COLD_PATH=${MINIO_COLD_PATH:-s3a://flight-data-lake/raw_data}
-      # 콜드 패스 트리거 간격. 핫 패스(10초)와 분리돼 있어 길게 잡을수록
-      # Parquet 파일이 크고 적게 생긴다 (300초 = 배치당 30배 적은 파일).
-      - COLD_TRIGGER=${COLD_TRIGGER:-300 seconds}
+      # 콜드 패스 트리거 간격. 길게 잡을수록 Parquet 파일이 크고 적게 생긴다.
+      #
+      # 300 → 120초로 줄였다 (2026-09-10). 긴 트리거에는 보이지 않던 대가가 있었다:
+      # **재시작 간격이 트리거보다 짧으면 트리거 시계가 매번 초기화되어 콜드 쿼리가
+      # 한 번도 발화하지 못한다.** 핫 패스는 3초라 영향이 없어 눈에 띄지 않는다.
+      #
+      # 실제로 데이터를 잃었다: A-3 백로그 테스트와 retention 변경으로 spark를
+      # 12회 기동하는 동안 콜드 패스가 굶어, 08:14~08:51의 실비행 37분치가
+      # Postgres에는 들어갔지만 MinIO에는 남지 않았다. 세션 초기화로 Kafka와
+      # Postgres가 비워지면서 복구 불가능해졌다 — 학습 데이터의 영구 손실이다.
+      #
+      # 120초는 손실 상한을 줄이는 것이지 없애지 못한다. 120초보다 잦은 재시작이
+      # 반복되면 여전히 굶는다. 그래서 랙 가시화(scripts/measure_lag.py --cold)를
+      # 함께 넣었다 — 굶는 상태가 '침묵'이 아니라 관측되게 하는 것이 핵심이다.
+      - COLD_TRIGGER=${COLD_TRIGGER:-120 seconds}
     # 2026-09-09 spark가 OOMKilled(exit 137)로 죽었는데, 한도가 없어서 "spark 자체가
     # 자란 것"인지 "Docker VM 전체가 압박받은 것"인지 구분할 수 없었다. 한도를 명시해야
     # OOM이 재현 가능하고 귀속 가능한 사건이 된다. 실측 최대치가 1,213MiB(20배 부하,
