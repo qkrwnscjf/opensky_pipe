@@ -313,11 +313,25 @@ for d in (checkpoint_dir, cold_checkpoint_dir):
     if not os.path.exists(d):
         os.makedirs(d)
 
-# 핫 패스 — 서빙용. 10초 트리거를 유지해야 UI의 실시간성이 보장된다.
+# 핫 패스 — 서빙용.
+#
+# 트리거를 10초 → 3초로 줄였다 (A-5, 2026-09-10). 이전에는 줄일 수 없었다:
+# 배치가 잦아지면 MinIO에 작은 Parquet이 폭증하기 때문이었다. Phase 1-1에서 콜드
+# 패스를 300초 트리거의 별도 쿼리로 분리하면서 **핫 패스 트리거가 콜드 패스 파일
+# 크기와 무관해졌고**, 그래서 비로소 줄일 수 있게 됐다.
+#
+# 3초를 고른 근거는 실측이다 (2026-09-10, 117행/배치):
+#   배치 작업시간 p50 1,161ms / p95 1,666ms / max 1,916ms
+# 배치가 트리거를 넘기면 밀려서 오히려 지연이 늘므로 max 대비 1.5배 이상의 여유가
+# 필요하다. 3초는 1.57배. 2초는 1.04배로 여유가 없어 배제했다.
+#
+# 이 값이 줄이는 것은 'Kafka에 도착한 레코드가 처리될 때까지의 대기'다. producer
+# 폴링 주기(10초)는 건드리지 않는다 — 줄이면 OpenSky 크레딧 소모가 늘고 실제로
+# 2026-09-09에 429(일일 한도 소진)를 겪었다.
 hot_query = df_processed.writeStream \
     .foreachBatch(save_to_hot) \
     .outputMode("append") \
-    .trigger(processingTime="10 seconds") \
+    .trigger(processingTime=os.getenv("HOT_TRIGGER", "3 seconds")) \
     .option("checkpointLocation", checkpoint_dir) \
     .start()
 
