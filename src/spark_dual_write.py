@@ -227,7 +227,7 @@ def notify_flight_update():
 #
 # 따라서 부하 테스트 시에는 경로 자체를 분리한다:
 #   MINIO_COLD_PATH=s3a://flight-data-lake/synthetic docker compose up -d spark
-COLD_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/raw_data")
+COLD_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/positions")
 
 
 def save_to_hot(batch_df, batch_id):
@@ -512,19 +512,74 @@ hot_query = df_flagged.writeStream \
 #
 # 대가: Kafka를 두 번 읽는다(쿼리마다 독립 컨슈머). 현재 트래픽에서는 무시할 수
 # 있지만, B-1 지리 확장 시 재검토가 필요하다.
-cold_query = df_processed \
-    .withColumn("dt", date_format(col("timestamp"), "yyyy-MM-dd")) \
-    .writeStream \
-    .format("parquet") \
+def save_to_cold(batch_df, batch_id):
+    """콜드 패스 적재. foreachBatch 안에서 일반 DataFrameWriter로 쓴다.
+
+    【왜 네이티브 parquet 싱크를 버렸나 — 2026-09-13】
+    네이티브 file sink(FileStreamSink)는 출력 경로 안의 _spark_metadata 커밋
+    로그로 exactly-once를 보장한다. 이 로그는 체크포인트와 **같은 배치 ID
+    체계를 공유해야 한다.** 그런데 수명이 달랐다:
+
+      체크포인트       → 익명 볼륨, 세션마다 초기화 → 배치 ID가 0부터 재시작
+      _spark_metadata  → MinIO, 영구 → 이전 세션의 배치 ID가 남음
+
+    새 세션의 콜드 쿼리가 배치 0부터 시작하는데 커밋 로그엔 이전 세션 것(3~8)만
+    남아 있어 어긋났고, 로그 압축 시점에 없는 배치 0을 찾다가
+    BATCH_METADATA_NOT_FOUND로 죽었다. 40분간 콜드 커밋이 0건이었다.
+
+    Phase 1-2에서 "Kafka와 체크포인트는 짝이라 같은 수명으로 묶는다"고 했는데,
+    체크포인트는 _spark_metadata와도 짝이었다. 체크포인트 하나가 휘발(Kafka)과
+    영구(_spark_metadata) 두 수명에 동시에 맞춰야 하므로 **구조적으로 불가능**했다.
+
+    foreachBatch는 _spark_metadata를 쓰지 않으므로 충돌 자체가 사라진다.
+
+    【대가】 exactly-once → at-least-once. 쓰기 성공 후 체크포인트 커밋 전에
+    크래시하면 그 배치가 재처리되어 중복될 수 있다. 세션 시작 시엔 Kafka가
+    비어 있어 무해하고, 세션 중 크래시 경계에서만 발생한다. 콜드 패스 소비자
+    (B-2)는 (icao24, timestamp) 기준 중복 제거를 전제로 한다.
+
+    【부수 효과】 이제 리더가 _spark_metadata를 신경 쓸 필요가 없다 — 디렉터리를
+    그대로 읽으면 된다. 실패한 쓰기 잡은 Spark가 임시 파일을 정리한다.
+    """
+    # coalesce(1): 배치당 파일 1개로 합친다.
+    # Kafka 토픽이 파티션 6개라 DataFrame도 6개로 나뉘고, partitionBy는 Spark
+    # 파티션마다 파일을 하나씩 쓴다. 2026-09-13 실측: 배치당 6개, 평균 6.0KB.
+    # 콜드 패스는 배치당 수백 행 수준이라 한 태스크로 몰아도 부담이 없다.
+    batch_df \
+        .withColumn("dt", date_format(col("timestamp"), "yyyy-MM-dd")) \
+        .coalesce(1) \
+        .write \
+        .mode("append") \
+        .partitionBy("dt") \
+        .parquet(COLD_PATH)
+
+
+cold_query = df_processed.writeStream \
+    .foreachBatch(save_to_cold) \
     .outputMode("append") \
-    .partitionBy("dt") \
-    .option("path", COLD_PATH) \
     .option("checkpointLocation", cold_checkpoint_dir) \
-    .trigger(processingTime=os.getenv("COLD_TRIGGER", "300 seconds")) \
+    .trigger(processingTime=os.getenv("COLD_TRIGGER", "120 seconds")) \
     .start()
 
 start_metrics_reporter(hot_query, label="hot")
 start_metrics_reporter(cold_query, label="cold")
 
 print("TACTICAL_ETL_SYSTEM: OPERATIONAL")
-hot_query.awaitTermination()
+
+# 두 쿼리 중 **하나라도** 종료되면 프로세스를 끝낸다.
+#
+# 이전에는 hot_query.awaitTermination()만 호출해 핫 쿼리만 감시했다. 그래서
+# 2026-09-13 콜드 쿼리가 BATCH_METADATA_NOT_FOUND로 죽었을 때 프로세스는 계속
+# 살아 있었고, 핫 패스와 UI가 정상이라 **40분간 아무 신호가 없었다.**
+#
+# awaitAnyTermination은 먼저 끝난 쿼리의 예외를 그대로 올리므로 컨테이너가
+# 비정상 종료되고 restart: unless-stopped가 둘 다 다시 띄운다.
+# 대가: 콜드가 결정적으로 실패하면 핫 패스까지 함께 재시작을 반복한다(UI 중단).
+# 이 프로젝트에서는 조용한 소실보다 드러나는 크래시 루프(RestartCount)가 낫다.
+try:
+    spark.streams.awaitAnyTermination()
+finally:
+    for name, q in (("hot", hot_query), ("cold", cold_query)):
+        if not q.isActive:
+            print(f"QUERY_TERMINATED[{name}]: {q.exception()}")
+

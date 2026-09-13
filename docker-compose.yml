@@ -155,10 +155,13 @@ services:
   spark:
     build: .
     container_name: spark
-    # 크래시(2026-09-09 OOM 등) 시 자동 복구. 중요한 건 '같은 컨테이너를 다시
-    # 띄운다'는 점이다 — 익명 볼륨의 체크포인트가 유지되므로 Kafka를 처음부터
-    # 다시 읽어 콜드 패스에 중복을 쌓는 일이 없다. 수동 재생성(up --build)만
-    # 볼륨을 새로 만든다.
+    # 크래시(2026-09-09 OOM 등) 시 자동 복구. 익명 볼륨의 체크포인트가 유지되므로
+    # Kafka를 처음부터 다시 읽지 않는다. 참고: `up -d --force-recreate`로 컨테이너를
+    # 재생성해도 Compose가 익명 볼륨을 재사용한다(2026-09-11 실측). 체크포인트가
+    # 비는 건 `down` 후 `up`(세션 시작) 또는 `--renew-anon-volumes`뿐이다.
+    #
+    # spark_dual_write.py가 awaitAnyTermination으로 두 쿼리를 모두 감시하므로,
+    # 핫·콜드 어느 쪽이 죽어도 컨테이너가 종료되고 이 정책이 재시작한다.
     restart: unless-stopped
     command: >
       bash -c "
@@ -183,7 +186,12 @@ services:
       # 가짜 레코드가 학습 데이터(docs/EXPANSION_PLAN.md 0.4)에 섞이지 않도록
       # 테스트 시에만 경로를 덮어쓴다:
       #   MINIO_COLD_PATH=s3a://flight-data-lake/synthetic docker compose up -d spark
-      - MINIO_COLD_PATH=${MINIO_COLD_PATH:-s3a://flight-data-lake/raw_data}
+      # raw_data → positions (2026-09-13). 콜드 쓰기를 foreachBatch로 바꾸면서 경로를
+      # 옮겼다. raw_data/ 안에는 이전 네이티브 싱크의 _spark_metadata가 남아 있는데,
+      # Spark 리더는 그 로그가 있으면 **로그에 등록된 파일만** 읽는다. 같은 경로에
+      # foreachBatch로 쓰면 새 파일이 로그에 없어 나중에 Spark로 읽을 때 전부 무시된다.
+      # 로그를 지우는 대신(영구 저장소 삭제) 새 경로를 쓴다. raw_data/는 보존된다.
+      - MINIO_COLD_PATH=${MINIO_COLD_PATH:-s3a://flight-data-lake/positions}
       # 콜드 패스 트리거 간격. 길게 잡을수록 Parquet 파일이 크고 적게 생긴다.
       #
       # 300 → 120초로 줄였다 (2026-09-10). 긴 트리거에는 보이지 않던 대가가 있었다:
