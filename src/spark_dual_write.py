@@ -296,7 +296,11 @@ def save_to_hot(batch_df, batch_id):
             db_name = os.getenv("DB_NAME", "flightdb")
             db_user = os.getenv("DB_USER", "myuser")
             db_password = os.getenv("DB_PASSWORD", "mypassword")
-            jdbc_url = f"jdbc:postgresql://{db_host}:{db_port}/{db_name}"
+            # reWriteBatchedInserts=true: PostgreSQL JDBC 드라이버가 batchsize로 묶인
+            # 개별 INSERT 문들을 하나의 multi-row INSERT로 재작성한다. 옵션이 없으면
+            # batchsize=1000을 줘도 드라이버는 문장을 하나씩 보내 왕복이 행 수만큼 생긴다.
+            jdbc_url = (f"jdbc:postgresql://{db_host}:{db_port}/{db_name}"
+                        f"?reWriteBatchedInserts=true")
 
             _timed("postgres", lambda: batch_df.write
                    .mode("append")
