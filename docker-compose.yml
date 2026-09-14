@@ -12,6 +12,15 @@ services:
     volumes:
       - /var/lib/zookeeper/data
       - /var/lib/zookeeper/log
+    # 포트가 열린 것이 아니라 '요청을 처리할 수 있는지'를 본다 (2026-09-14).
+    # srvr는 ZooKeeperServer가 실제로 돌 때만 Mode를 돌려준다. 3.6의 기본 4lw
+    # 허용 목록에 srvr가 들어 있어 별도 설정이 필요 없다.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "nc -w 2 localhost 2181 <<< srvr | grep -q Mode"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   # 2. Kafka (기존 유지)
   kafka:
@@ -19,8 +28,22 @@ services:
     container_name: kafka
     ports:
       - "9092:9092"
+    # 【기동 경합 — 2026-09-14 실제 발생】 세션 첫 기동에서 kafka가 exit 1로 죽고
+    # kafka-init이 무한 대기해 파이프라인 전체가 뜨지 않았다. 로그 대조 결과:
+    #   05:43:55.61  zookeeper가 2181 포트 바인딩 (서버는 아직 준비 전)
+    #   05:43:55.65  kafka의 zk-ready 접속이 이 틈에 들어가 "ZooKeeperServer not running"
+    #   05:43:55.70  zookeeper 준비 완료
+    #   05:44:36     zk-ready가 재시도로 회복하지 못하고 40초 타임아웃 → exit 1
+    # 느려서가 아니라 약 50ms 창의 경합이라 가끔만 재현된다.
+    #
+    # 두 겹으로 막는다:
+    #  1. service_healthy — zookeeper가 실제로 요청을 처리할 때만 kafka를 띄운다 (원인 차단).
+    #  2. restart — 다른 이유(예: 직전 세션의 브로커 등록이 남아 NodeExists)로
+    #     기동에 실패해도 kafka-init이 영원히 기다리는 상태로 굳지 않게 한다.
+    restart: unless-stopped
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     # 세션 휘발 (0.4). Zookeeper와 짝으로 비워져야 cluster ID가 어긋나지 않는다.
     volumes:
       - /var/lib/kafka/data
