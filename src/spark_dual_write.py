@@ -86,6 +86,24 @@ kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 #
 # B-1(아시아 확장)으로 트래픽이 수십 배가 되면 이 값이 평상시를 조이게 되므로
 # 반드시 재산정해야 한다. KAFKA_MAX_OFFSETS 환경변수로 조정 가능.
+#
+# kafka.fetch.max.wait.ms 500(기본값) → 50 (2026-09-14, 작업 순서 1-3).
+#
+# 핫 배치의 약 80%가 Kafka 읽기였는데, Spark 이벤트 로그로 쪼개 보니 CPU를 쓰지
+# 않고 **기다리고** 있었다: 읽기 태스크 실행 678ms 중 CPU 71ms. 대기 약 600ms는
+# 이 설정의 기본값 500ms와 맞아떨어진다.
+#
+# 원인은 컨슈머의 선행 fetch다. 레코드를 돌려준 직후 다음 fetch 요청을 미리 보내
+# 두는데, 핫 쿼리는 3초마다 로그 끝(tail)을 읽으므로 그 요청은 새 데이터가 없어
+# 브로커에서 최대 500ms를 채운다. 다음 배치는 그 요청이 끝나야 새 데이터를 받는다.
+# 120초 주기인 콜드 쿼리는 이미 만료된 뒤라 대기가 없었다(CPU 254 / 실행 363ms) —
+# 두 쿼리의 차이가 이 설명과 일치한다.
+#
+# A/B 교차 3라운드, 30·400건/3초 각 약 46배치 (docs/BENCHMARKS.md):
+#   count p50 812 → 316ms (-61%), 배치 합계 p50 1,097 → 579ms (-47%), 6쌍 전부 개선.
+#
+# 대가: 새 데이터가 없을 때 fetch가 50ms 만에 빈 응답으로 돌아온다. 태스크가 도는
+# 동안에만 생기므로 브로커 부하는 무시할 수준이다.
 df_raw = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", kafka_bootstrap) \
@@ -93,6 +111,7 @@ df_raw = spark.readStream \
     .option("startingOffsets", "earliest") \
     .option("failOnDataLoss", "false") \
     .option("maxOffsetsPerTrigger", os.getenv("KAFKA_MAX_OFFSETS", "500")) \
+    .option("kafka.fetch.max.wait.ms", os.getenv("KAFKA_FETCH_MAX_WAIT_MS", "50")) \
     .load()
 
 # ---------------------------------------------------------------
