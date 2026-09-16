@@ -38,7 +38,7 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 
 | 영역 | 기술 |
 | :--- | :--- |
-| Ingestion | Python, Kafka, Zookeeper |
+| Ingestion | Python, Kafka (KRaft 모드, ZooKeeper 없음) |
 | Processing | Apache Spark (Structured Streaming) |
 | Hot Path (실시간 서빙 DB) | PostgreSQL |
 | Cold Path (데이터 레이크) | MinIO (S3 Compatible), Parquet |
@@ -61,7 +61,7 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 docker-compose up -d --build
 ```
 
-`zookeeper`, `kafka`, `minio`, `postgres`, `airflow`, `airflow-postgres`와 함께 `producer`/`spark`/`backend` 앱 서비스까지 전부 자동 기동됩니다 — 수집부터 서빙까지 별도 수동 단계가 없습니다.
+`kafka`, `minio`, `postgres`, `airflow`, `airflow-postgres`와 함께 `producer`/`spark`/`backend` 앱 서비스까지 전부 자동 기동됩니다 — 수집부터 서빙까지 별도 수동 단계가 없습니다.
 
 | 서비스 | 주소 |
 | :--- | :--- |

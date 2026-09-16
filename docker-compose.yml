@@ -1,58 +1,71 @@
 services:
-  # 1. Zookeeper (기존 유지)
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.0.1
-    container_name: zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    # 세션 휘발 스토어 (docs/EXPANSION_PLAN.md 0.4). 익명 볼륨이라 컨테이너가
-    # 새로 만들어질 때(= docker compose down 후 up) 빈 상태로 시작한다.
-    # 세션 '중'의 재시작에서는 같은 컨테이너를 다시 띄우므로 데이터가 유지된다.
-    volumes:
-      - /var/lib/zookeeper/data
-      - /var/lib/zookeeper/log
-    # 포트가 열린 것이 아니라 '요청을 처리할 수 있는지'를 본다 (2026-09-14).
-    # srvr는 ZooKeeperServer가 실제로 돌 때만 Mode를 돌려준다. 3.6의 기본 4lw
-    # 허용 목록에 srvr가 들어 있어 별도 설정이 필요 없다.
-    healthcheck:
-      test: ["CMD", "bash", "-c", "nc -w 2 localhost 2181 <<< srvr | grep -q Mode"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-
-  # 2. Kafka (기존 유지)
+  # 1. Kafka — KRaft 모드 (2026-09-16, ZooKeeper 제거)
+  #
+  # 【왜 바꿨나】 브로커가 1대뿐이라 ZooKeeper가 하는 일(브로커 생존 확인, 컨트롤러
+  # 선출, 파티션 리더 선출)에 선택지가 없었다. 조정 이점은 0인데 컨테이너 하나와
+  # JVM 하나가 상주하며 메모리를 썼다. 오히려 비용만 실제로 발생했다:
+  #
+  #  - 기동 경합 (2026-09-14 실발생): zookeeper가 2181을 바인딩한 뒤 서버가 준비되기
+  #    전 약 50ms 틈에 kafka의 zk-ready가 접속해 거부당했고, 40초 타임아웃 뒤 exit 1.
+  #    kafka-init이 무한 대기해 파이프라인 전체가 뜨지 않았다. → 헬스체크로 막았지만
+  #    KRaft에서는 이 실패 지점 자체가 사라진다.
+  #  - cluster ID 불일치 위험: 메타데이터가 ZooKeeper에, 로그가 Kafka 볼륨에 나뉘어
+  #    있어 둘을 항상 같은 수명으로 묶어야 했다. KRaft는 메타데이터도 Kafka 볼륨
+  #    안(__cluster_metadata)에 있어 구조적으로 어긋날 수 없다.
+  #  - 임시 노드 잔존: 비정상 종료 시 /brokers/ids/1이 세션 타임아웃까지 남아
+  #    재기동이 NodeExists로 실패할 수 있었다.
+  #
+  # 【이미지 버전】 cp 7.0.1(Kafka 3.0)에서는 KRaft가 미리보기라 운영 사용이
+  # 권장되지 않았다. 7.9(Kafka 3.9)는 KRaft 정식 지원이면서 ZooKeeper 모드도 아직
+  # 남아 있어, 문제가 생기면 되돌리기 쉽다. Kafka 4.0부터는 ZooKeeper가 제거된다.
+  #
+  # 【클라이언트 영향 없음】 producer와 Spark는 브로커하고만 통신하고 ZooKeeper를
+  # 몰랐다. 두 코드는 한 줄도 바뀌지 않는다.
   kafka:
-    image: confluentinc/cp-kafka:7.0.1
+    image: confluentinc/cp-kafka:7.9.0
     container_name: kafka
     ports:
       - "9092:9092"
-    # 【기동 경합 — 2026-09-14 실제 발생】 세션 첫 기동에서 kafka가 exit 1로 죽고
-    # kafka-init이 무한 대기해 파이프라인 전체가 뜨지 않았다. 로그 대조 결과:
-    #   05:43:55.61  zookeeper가 2181 포트 바인딩 (서버는 아직 준비 전)
-    #   05:43:55.65  kafka의 zk-ready 접속이 이 틈에 들어가 "ZooKeeperServer not running"
-    #   05:43:55.70  zookeeper 준비 완료
-    #   05:44:36     zk-ready가 재시도로 회복하지 못하고 40초 타임아웃 → exit 1
-    # 느려서가 아니라 약 50ms 창의 경합이라 가끔만 재현된다.
-    #
-    # 두 겹으로 막는다:
-    #  1. service_healthy — zookeeper가 실제로 요청을 처리할 때만 kafka를 띄운다 (원인 차단).
-    #  2. restart — 다른 이유(예: 직전 세션의 브로커 등록이 남아 NodeExists)로
-    #     기동에 실패해도 kafka-init이 영원히 기다리는 상태로 굳지 않게 한다.
+    # 기동 실패가 kafka-init 무한 대기로 굳지 않도록 유지한다. KRaft에서는 ZooKeeper
+    # 경합이 사라지지만, 다른 원인(디스크, 포트 충돌)의 백스톱으로 남긴다.
     restart: unless-stopped
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-    # 세션 휘발 (0.4). Zookeeper와 짝으로 비워져야 cluster ID가 어긋나지 않는다.
+    # 세션 휘발 (0.4). KRaft에서는 이 볼륨 하나에 **메시지 로그와 메타데이터 로그가
+    # 함께** 들어간다. 그래서 "ZooKeeper와 짝을 맞춰 비운다"는 제약이 없어졌다.
     volumes:
       - /var/lib/kafka/data
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # ── KRaft 핵심 설정 ──────────────────────────────────────────────
+      # 브로커와 컨트롤러를 한 프로세스가 겸한다(단일 노드라 분리할 이유가 없다).
+      KAFKA_PROCESS_ROLES: broker,controller
+      # KRaft에서는 BROKER_ID 대신 NODE_ID를 쓴다(브로커·컨트롤러 공통 식별자).
+      KAFKA_NODE_ID: 1
+      # 컨트롤러 쿼럼 구성원 목록: <node id>@<host>:<controller port>
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # 저장소 포맷 시 기록되는 클러스터 ID. 고정값으로 두면 세션마다 볼륨이 비워져
+      # 새로 포맷돼도 항상 같은 ID가 되어 재현 가능하다.
+      CLUSTER_ID: RY0InBUoSi-7trUCYSeIaw
+      # ── 리스너 ──────────────────────────────────────────────────────
+      # CONTROLLER(29093)가 추가됐다. 컨트롤러 통신 전용이라 advertised에는 넣지
+      # 않는다. 나머지 둘은 기존과 동일:
+      #   PLAINTEXT(29092)      컨테이너 간 — producer, spark, kafka-init
+      #   PLAINTEXT_HOST(9092)  호스트에서 접근
+      #
+      # 컨트롤러만 0.0.0.0이 아니라 `kafka`에 바인딩하는 이유 (2026-09-16 실패 경험):
+      # advertised.listeners에 컨트롤러를 넣지 않아도, KRaft는 쿼럼 구성원이 서로를
+      # 찾을 때 쓸 주소로 listeners의 컨트롤러 항목을 그대로 쓴다. 0.0.0.0이면
+      # 저장소 포맷 단계에서 바로 죽는다:
+      #   IllegalArgumentException: advertised.listeners cannot use the
+      #   nonroutable meta-address 0.0.0.0
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://kafka:29093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # ── 단일 노드용 복제 계수 ─────────────────────────────────────────
+      # 내부 토픽 기본 복제 계수는 3이라 브로커 1대에서는 생성이 실패한다.
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       # Phase 1 (docs/EXPANSION_PLAN.md): 새로 생성되는 토픽의 기본 파티션 수. 이미 존재하는
       # flight_data_raw 토픽에는 소급 적용되지 않으므로, 기존 토픽은 `kafka-topics --alter`로 늘려야 함.
