@@ -33,12 +33,17 @@ DB_NAME = os.getenv("DB_NAME", "flightdb")
 DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 engine = create_engine(DB_URL)
 
+# 2026-09-17: flight_data(append-only, DISTINCT ON으로 매번 재계산) 대신
+# flight_current(PK=icao24, spark_dual_write.py가 UPSERT로 채움)를 조회한다.
+# 기본키가 "기체당 정확히 1행"을 DB 제약으로 보장하므로 DISTINCT ON이 필요 없다
+# — 이전에는 이 보장이 조회 쪽 관례(쿼리를 이렇게 짜야 한다는 약속)에만 있었다.
+# ORDER BY는 결과 순서를 안정적으로 만들 뿐 중복 제거와는 무관하다.
+# 궤적(TRAIL_QUERY)은 이력이 필요하므로 flight_data를 그대로 쓴다 — 변경 없음.
 FLIGHTS_QUERY = text("""
-    SELECT DISTINCT ON (icao24)
-        icao24, callsign, origin_country, latitude, longitude, velocity, geo_altitude as altitude, timestamp, true_track
-    FROM flight_data
+    SELECT icao24, callsign, origin_country, latitude, longitude, velocity, geo_altitude as altitude, timestamp, true_track
+    FROM flight_current
     WHERE timestamp >= NOW() - INTERVAL '5 minutes'
-    ORDER BY icao24, timestamp DESC
+    ORDER BY icao24
 """)
 
 

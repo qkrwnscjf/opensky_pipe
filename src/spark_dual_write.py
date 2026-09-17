@@ -5,6 +5,7 @@ import threading
 import time
 
 import psycopg2
+from psycopg2.extras import execute_values
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, to_timestamp, from_unixtime, date_format,
@@ -12,7 +13,7 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType, LongType, IntegerType
 
-from flight_schema import FLIGHT_FIELDS
+from flight_schema import FLIGHT_FIELDS, FIELD_NAMES
 
 # ---------------------------------------------------------------
 # 1. Spark 세션 생성
@@ -154,10 +155,13 @@ df_processed = df_flagged.filter(col("_valid")).drop("_valid")
 # 문서에만 "적용됨"으로 적혀 있던 걸 실제로 코드화. 첫 성공 배치 이후엔 매번 재확인할 필요 없어 플래그로 가드.
 #
 # 두 인덱스는 역할이 다르다 (Phase 0 벤치마크에서 실측 확인, docs/BENCHMARKS.md 참고):
-# - idx_flight_latest (icao24, timestamp DESC): icao24 단건 조회용 (향후 궤적 조회 등). icao24가
-#   선행 컬럼이라 /flights의 `WHERE timestamp >= ...` 필터에는 쓰이지 않는다 — Seq Scan을 못 없앰.
-# - idx_flight_timestamp (timestamp DESC): timestamp가 선행 컬럼이라 /flights의 WHERE 필터가
-#   실제로 이 인덱스를 타서 Seq Scan → Index Scan 전환이 가능하다 (Phase 1에서 합성 부하로 실측).
+# - idx_flight_latest (icao24, timestamp DESC): 궤적 조회(/flights/{icao24}/trail,
+#   WHERE icao24 = ... AND timestamp >= ...)가 쓴다.
+# - idx_flight_timestamp (timestamp DESC): 원래 /flights의 `WHERE timestamp >= ...`
+#   필터를 위해 만들었고 실측으로 Seq Scan → Index Scan 전환을 확인했다(Phase 1).
+#   【2026-09-17 갱신】 /flights는 이제 flight_current를 읽어(아래 참고) 이 인덱스를
+#   쓰지 않는다. flight_data에 남기는 이유는 db_cleanup의 `WHERE timestamp < ...`
+#   DELETE가 여전히 이 인덱스를 쓸 수 있어서다 — 효과는 측정하지 않았다.
 _index_ready = False
 
 
@@ -186,6 +190,137 @@ def ensure_index():
         print("INDEX_READY: idx_flight_latest, idx_flight_timestamp ensured on flight_data")
     except Exception as e:
         print(f"INDEX_SETUP_WARNING: {e}")
+
+
+# ---------------------------------------------------------------
+# flight_current — 목적 1(전체 기체 실시간 위치) 전용 상태 테이블
+# ---------------------------------------------------------------
+# 2026-09-17 설계 논의(docs/TASK_ORDER.md 0-4)에서 나온 결론을 코드화한다.
+#
+# 지금까지 목적 1("현재 하늘에 있는 모든 기체의 최신 위치")과 목적 2("한 기체의
+# 30분 궤적")를 flight_data 하나로 처리했다. flight_data는 append-only라 목적
+# 1을 답하려면 매번 DISTINCT ON (icao24)으로 이력 전체에서 최신 행을 재계산해야
+# 했다 — 그리고 "기체당 정확히 1행"이라는 목적 1의 요구사항이 DB 제약이 아니라
+# 조회 관례로만 지켜지고 있었다.
+#
+# flight_current는 icao24를 기본키로 둔다. timestamp는 여기서 "행을 구분하는
+# 정체성"이 아니라 "덮어써도 되는지 판단하는 조건"이 된다 — UPSERT의
+# WHERE flight_current.timestamp < EXCLUDED.timestamp 절이 그 조건이다. 이게
+# 없으면 at-least-once 재처리로 늦게 도착한 오래된 배치가 이미 반영된 최신
+# 상태를 과거로 되돌릴 수 있다. icao24 키 기반 파티션 순서 보장(A-2)이 정상
+# 배치 순서를 지켜주는 것과 별개로, 이 조건절이 재처리 시의 역전까지 막는다.
+#
+# flight_data는 그대로 둔다 — 목적 2(궤적)에는 이력 전체가 필요하고, 이 테이블의
+# append 방식은 이번 변경과 무관하다.
+_current_table_ready = False
+
+# CREATE TABLE 시 flight_data와 같은 컬럼 타입을 쓴다 — 스키마 두 벌을 관리하지
+# 않기 위해 FLIGHT_FIELDS를 그대로 재사용한다. timestamp만 예외: FLIGHT_FIELDS엔
+# "long"(epoch)으로 선언돼 있지만 실제로 이 테이블에 들어오는 값은 df_flagged의
+# 변환을 거친 TimestampType이므로, DDL도 TIMESTAMP로 맞춘다(flight_data가 Spark
+# JDBC writer의 자동 매핑으로 이미 그렇게 만들어진 것과 동일).
+_PG_TYPES = {"string": "TEXT", "long": "BIGINT", "double": "DOUBLE PRECISION",
+             "boolean": "BOOLEAN", "int": "INTEGER"}
+
+
+def ensure_current_table():
+    global _current_table_ready
+    if _current_table_ready:
+        return
+    try:
+        cols_ddl = ", ".join(
+            f"{name} TIMESTAMP" if name == "timestamp" else f"{name} {_PG_TYPES[type_name]}"
+            for name, type_name, _ in FLIGHT_FIELDS
+        )
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=os.getenv("DB_PORT", "5432"),
+            dbname=os.getenv("DB_NAME", "flightdb"),
+            user=os.getenv("DB_USER", "myuser"),
+            password=os.getenv("DB_PASSWORD", "mypassword"),
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS flight_current ({cols_ddl}, PRIMARY KEY (icao24))"
+            )
+            # /flights가 여기에 5분 신선도 필터(WHERE timestamp >= ...)를 건다.
+            # 테이블이 기체 수만큼(수백 행 이하)이라 지금 규모에선 없어도 무방하지만,
+            # idx_flight_timestamp를 flight_data에 만든 것과 같은 패턴을 미리 맞춰둔다
+            # — 효과는 측정하지 않았다.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_current_timestamp ON flight_current (timestamp DESC)"
+            )
+        conn.close()
+        _current_table_ready = True
+        print("CURRENT_TABLE_READY: flight_current ensured (PK icao24)")
+    except Exception as e:
+        print(f"CURRENT_TABLE_SETUP_WARNING: {e}")
+
+
+def upsert_flight_current(batch_df):
+    """유효 레코드를 flight_current에 UPSERT한다.
+
+    Spark의 DataFrameWriter.jdbc()는 append(순수 INSERT)만 지원하고 ON CONFLICT를
+    모른다. 그래서 flight_data처럼 표준 JDBC 쓰기 경로를 쓰지 못하고, 파티션마다
+    별도 연결을 열어 psycopg2로 직접 실행한다 — flight_data의 JDBC append가
+    파티션당 태스크 1개·연결 1개인 것과 같은 병렬 구조를 유지한다.
+
+    partition마다 새로 연결하는 이유: foreachPartition은 executor에서 실행돼
+    드라이버의 _notify_conn 같은 전역 연결을 재사용할 수 없다. 배치당 발생 비용은
+    flight_data JDBC append와 동급(연결 수만큼)이라 새로운 비용 항목은 아니다.
+    """
+    cols = FIELD_NAMES
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "icao24")
+    sql = (
+        f"INSERT INTO flight_current ({', '.join(cols)}) VALUES %s "
+        f"ON CONFLICT (icao24) DO UPDATE SET {set_clause} "
+        f"WHERE flight_current.timestamp < EXCLUDED.timestamp"
+    )
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", "flightdb")
+    db_user = os.getenv("DB_USER", "myuser")
+    db_password = os.getenv("DB_PASSWORD", "mypassword")
+
+    def _write_partition(rows):
+        # 배치 안의 중복 icao24를 먼저 접는다 (2026-09-17 실행 중 발견한 문제).
+        #
+        # Postgres는 ON CONFLICT DO UPDATE가 **한 명령 안에서 같은 키를 두 번**
+        # 건드리는 것을 금지한다:
+        #   CardinalityViolation: ON CONFLICT DO UPDATE command cannot affect
+        #   row a second time
+        # Spark 배치 하나는 producer 폴링 주기 여러 번을 걸칠 수 있어(기동 직후
+        # earliest부터 읽을 때가 대표적), 같은 기체가 한 배치에 여러 번 들어온다.
+        #
+        # 여기서 접어도 되는 근거: icao24가 Kafka 파티션 키라(A-2) 같은 기체의
+        # 레코드는 전부 같은 Kafka 파티션 = 같은 Spark 파티션에 모인다. 따라서
+        # 파티션 안에서만 접어도 배치 전체의 중복이 사라진다 — 셔플이 필요 없다.
+        # 혹시 이 가정이 깨져도(예: minPartitions로 한 파티션을 쪼개는 경우)
+        # SQL의 WHERE timestamp < EXCLUDED.timestamp 조건이 여전히 최신값을
+        # 지켜주므로 결과가 틀어지지 않는다 — 문장이 두 번 나갈 뿐이다.
+        #
+        # 이건 사실 조회 때 하던 DISTINCT ON 작업을 쓰기 시점으로 옮긴 것이다.
+        # 배치당 한 번(약 90행)만 하면 되고, 조회할 때마다 수천 행을 훑던 것과
+        # 대비된다.
+        latest = {}
+        for row in rows:
+            prev = latest.get(row["icao24"])
+            if prev is None or row["timestamp"] > prev["timestamp"]:
+                latest[row["icao24"]] = row
+        values = [tuple(row[c] for c in cols) for row in latest.values()]
+        if not values:
+            return
+        conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name,
+                                 user=db_user, password=db_password)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                execute_values(cur, sql, values)
+        finally:
+            conn.close()
+
+    batch_df.foreachPartition(_write_partition)
 
 
 # Phase 2 (docs/EXPANSION_PLAN.md): 배치가 Postgres에 성공적으로 쓰인 직후 호출.
@@ -333,6 +468,10 @@ def save_to_hot(batch_df, batch_id):
                    .save())
 
             _timed("ensure_index", ensure_index)
+            _timed("ensure_current_table", ensure_current_table)
+            # flight_data와 같은 batch_df(유효 레코드만)를 그대로 재사용한다 —
+            # Kafka를 다시 읽지 않는다. persist()가 이미 캐시해 둔 덕분이다.
+            _timed("current_upsert", lambda: upsert_flight_current(batch_df))
             _timed("notify", notify_flight_update)
 
         except Exception as e:
