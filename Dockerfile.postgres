@@ -1,0 +1,10 @@
+# Postgres + pg_cron (2026-09-18, docs/TASK_ORDER.md 0-5)
+#
+# 공식 postgres:15 이미지엔 pg_cron이 들어 있지 않다. `db_cleanup`을 Airflow에서
+# 걷어내고 DB 안에서 직접 스케줄하려면 확장 하나만 더 있으면 되므로, 무거운
+# 오케스트레이터 대신 이 한 줄짜리 이미지 확장으로 대체한다.
+FROM postgres:15
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends postgresql-15-cron \
+  && rm -rf /var/lib/apt/lists/*

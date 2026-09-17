@@ -136,20 +136,40 @@ services:
     volumes:
       - minio_data:/data
 
-  # 4. PostgreSQL (New! - 웹 서비스용 DB)
+  # 4. PostgreSQL (웹 서비스용 DB + pg_cron 스케줄러)
+  #
+  # 2026-09-18 (0-5): 이미지를 postgres:15 → Dockerfile.postgres(= postgres:15 +
+  # pg_cron)로 바꿨다. `db_cleanup`을 Airflow DAG에서 DB 안으로 옮기기 위해서다.
+  # 삭제 쿼리 한 줄을 돌리려고 Airflow(웹서버+스케줄러+전용 메타DB) 세 컨테이너를
+  # 상시 띄우던 구조를 확장 하나로 대체했다.
   postgres:
-    image: postgres:15
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
     container_name: postgres
     ports:
       - "5432:5432"
+    # pg_cron은 백그라운드 워커라 shared_preload_libraries에 있어야 뜬다(재시작 필요한
+    # 설정이라 런타임 SET으로는 안 된다). cron.database_name은 확장과 작업 테이블이
+    # 살 데이터베이스를 지정한다 — 앱 DB와 같게 둬야 초기화 SQL에서 바로 등록할 수 있다.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=${DB_NAME:-flightdb}
     environment:
       POSTGRES_USER: ${DB_USER:-myuser}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-mypassword}
       POSTGRES_DB: ${DB_NAME:-flightdb}
     # 세션 휘발 (0.4). flight_data 테이블은 Spark JDBC writer가 첫 append 때
     # 자동 생성하고, 인덱스는 ensure_index()가 만들므로 빈 DB로 시작해도 된다.
+    #
+    # db/init은 공식 이미지의 초기화 훅이다. 데이터 디렉터리가 빌 때만 실행되는데,
+    # 이 프로젝트에선 그게 곧 "세션 시작"이라 매 세션 cron 작업이 새로 등록된다.
     volumes:
       - /var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
 
   # 5. MinIO 버킷 초기화 (data lake 버킷을 미리 만들어둠 - 없으면 Spark 저장이 계속 실패함)
   minio-init:
@@ -291,59 +311,6 @@ services:
       - DB_NAME=${DB_NAME:-flightdb}
     depends_on:
       - postgres
-
-  # [여기서부터 추가] Airflow 섹션
-  airflow:
-    build: .
-    container_name: airflow
-    # [수정] 명령어를 더 명확하고 견고하게 분리 (| 사용)
-    command: |
-      bash -c "
-      echo 'Waiting for airflow-postgres...'
-      until python -c 'import socket; s = socket.socket(); s.connect((\"airflow-postgres\", 5432))' 2>/dev/null; do
-        sleep 1
-      done
-      echo 'Initializing database...'
-      airflow db migrate
-      echo 'Creating admin user...'
-      airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@example.com --password admin || true
-      echo 'Starting scheduler and webserver...'
-      airflow scheduler &
-      exec airflow webserver
-      "
-    environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW_VAR_MINIO_ENDPOINT=http://minio:9000
-      - AIRFLOW_VAR_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      - MINIO_ACCESS_KEY=${MINIO_USER:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_PASSWORD:-minioadmin}
-      - DB_USER=${DB_USER:-myuser}
-      - DB_PASSWORD=${DB_PASSWORD:-mypassword}
-      - DB_NAME=${DB_NAME:-flightdb}
-      - DB_HOST=postgres
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./data:/opt/airflow/data
-    depends_on:
-      - airflow-postgres
-      - kafka
-      - minio
-
-  # Airflow 전용 메타데이터 DB
-  airflow-postgres:
-    image: postgres:13
-    container_name: airflow-postgres
-    environment:
-      - POSTGRES_USER=airflow
-      - POSTGRES_PASSWORD=airflow
-      - POSTGRES_DB=airflow
-    ports:
-      - "5433:5432"
 
 volumes:
   # 유일한 영구 저장소. B-2(궤적 예측) 학습 데이터의 원천이므로 세션을 넘어

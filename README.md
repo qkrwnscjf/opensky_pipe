@@ -29,7 +29,7 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 | 설계 포인트 | 이유 |
 | :--- | :--- |
 | **PostgreSQL은 append-only** | 매 폴링마다 새 행을 쌓기만 함. 항공기별 최신 위치만 보려면 `icao24` 기준 `DISTINCT ON`이 필수 (`/flights`가 이미 구현) — 안 하면 지도에 과거 위치가 중복 표시됨. |
-| **MinIO는 모든 이력을 영구 보관** | Postgres는 `db_cleanup` DAG가 1시간마다 오래된 행을 정리하지만, MinIO의 Parquet은 지워지지 않음 — 실시간 서빙과 장기 분석용 데이터를 분리. 현재는 **적재 전용**이며, 향후 **항공기 궤적 예측 모델의 학습 데이터셋**으로 사용할 목적으로 보존 중. |
+| **MinIO는 모든 이력을 영구 보관** | Postgres는 `pg_cron`이 1시간마다 오래된 행을 정리하지만, MinIO의 Parquet은 지워지지 않음 — 실시간 서빙과 장기 분석용 데이터를 분리. 현재는 **적재 전용**이며, 향후 **항공기 궤적 예측 모델의 학습 데이터셋**으로 사용할 목적으로 보존 중. |
 | **Polling 대신 LISTEN/NOTIFY** | Spark가 배치를 쓴 직후 `pg_notify`를 호출하면 백엔드가 즉시 연결된 WebSocket 클라이언트에 브로드캐스트 — 화면 반영 지연을 평균 5초에서 630ms로 단축. |
 
 ---
@@ -42,7 +42,7 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 | Processing | Apache Spark (Structured Streaming) |
 | Hot Path (실시간 서빙 DB) | PostgreSQL |
 | Cold Path (데이터 레이크) | MinIO (S3 Compatible), Parquet |
-| Orchestration | Apache Airflow |
+| 스케줄링 | pg_cron (PostgreSQL 확장) |
 | Serving API | FastAPI (REST `/flights` + WebSocket `/ws/flights`) |
 | Frontend | React, Leaflet |
 | Infra | Docker / docker-compose |
@@ -61,11 +61,10 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
 docker-compose up -d --build
 ```
 
-`kafka`, `minio`, `postgres`, `airflow`, `airflow-postgres`와 함께 `producer`/`spark`/`backend` 앱 서비스까지 전부 자동 기동됩니다 — 수집부터 서빙까지 별도 수동 단계가 없습니다.
+`kafka`, `minio`, `postgres`와 함께 `producer`/`spark`/`backend` 앱 서비스까지 전부 자동 기동됩니다 — 수집부터 서빙까지 별도 수동 단계가 없습니다.
 
 | 서비스 | 주소 |
 | :--- | :--- |
-| Airflow UI | `localhost:8080` (admin/admin) |
 | MinIO 콘솔 | `localhost:9001` |
 | PostgreSQL | `localhost:5432` (`flightdb`) |
 | Backend REST | `localhost:8000/flights` |
