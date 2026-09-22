@@ -33,10 +33,18 @@ RUN mkdir -p /tmp/spark_checkpoints_final /tmp/spark_checkpoints_cold \
 USER airflow
 
 # 4. 필요한 Python 라이브러리 설치
+#
+# boto3: 콜드 패스 배치 ETL이 MinIO를 직접 다룬다 (0-6).
+#  - dags/flight_lakehouse_etl.py: Bronze의 dt= 목록과 완료 마커 목록을 나열해
+#    처리할 날짜를 고른다. Spark를 띄우지 않고 판단하려면 S3 API가 필요하다.
+#  - src/spark_batch_etl.py: 쓰기 성공 후 _SUCCESS 마커를 남긴다.
+# Spark의 s3a로도 되지만 그쪽은 JVM이 떠야 하고, 여기 쓰임은 객체 나열과
+# 작은 put 하나뿐이다.
 RUN pip install --no-cache-dir \
     pyspark==3.5.0 \
     apache-airflow-providers-apache-spark \
     kafka-python \
     psycopg2-binary \
     pandas \
-    python-dotenv
+    python-dotenv \
+    boto3
