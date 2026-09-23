@@ -13,10 +13,13 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
                      flight_data_raw (KRaft, 6파티션, key=icao24)
                                     │
               ┌─────────────────────┴─────────────────────┐
+              │   쿼리마다 readStream을 따로 잡는다 (0-6b)      │
               ▼                                             ▼
 ┌───────────────────────────────┐          ┌───────────────────────────────────┐
-│  HOT 쿼리 (3초 트리거)  [✅]      │          │  COLD 쿼리 (120초 트리거)  [✅]        │
-│  from_json → _valid 플래그       │          │  from_json → _valid 필터            │
+│  HOT 쿼리  [✅]                  │          │  COLD 쿼리  [✅]                     │
+│  3초 트리거 / 500건 상한          │          │  120초 트리거 / 5,000건 상한          │
+│  = 166행/s                     │          │  = 41.7행/s                        │
+│  parse_and_flag() → _valid 플래그 │          │  parse_and_flag() → _valid 필터      │
 └───────────┬───────────────────┘          └───────────┬─────────────────────┘
             ▼                                           ▼
    ┌─────────────────┐                        dt=YYYY-MM-DD 파티션, coalesce(1)
@@ -28,29 +31,34 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
    │    icao24, 조건절) │                    │ (영구 보관, at-least-once) │
    └────┬────────┬────┘                    └────────────┬──────────────┘
         │        │                                       │
-        ▼        ▼                                       │ 📋 여기부터 설계만
+        ▼        ▼                                       │ ✅ 구현·검증 완료, 실운영 전
 ┌──────────┐ ┌──────────────┐                             ▼
 │flight_data│ │flight_current│            ┌───────────────────────────────┐
-│(이력, 1시간)│ │(상태, PK=    │            │ Airflow DAG  [📋]                │
-│           │ │ icao24)      │            │ schedule_interval=None (수동)     │
-└─────┬─────┘ └──────┬───────┘            │  → spark-submit spark_batch_etl.py│
+│(이력, 1시간)│ │(상태, PK=    │            │ Airflow DAG  [✅ 검증 / paused]    │
+│ pg_cron이  │ │ icao24)      │            │ flight_lakehouse_etl            │
+│ 매시 정리   │ │ 조건부 UPSERT │            │ "0 1 * * *" UTC, catchup=False  │
+└─────┬─────┘ └──────┬───────┘            │ Bronze dt= − 마커 − 오늘         │
+      │              │                    │  → 날짜당 1태스크 동적 매핑        │
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ Spark 배치 ETL  [📋]              │
-      │              │                    │ Bronze dt= 파티션 읽음(spark.read) │
-      │              │                    │ 피처 엔지니어링(내용 미정)          │
+      │              │                    │ Spark 배치 ETL  [✅ 검증]          │
+      │              │                    │ spark_batch_etl.py --date <날짜>  │
+      │              │                    │ dropDuplicates(icao24,timestamp) │
+      │              │                    │ event_date 부여 → 성공 후 마커     │
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ MinIO — Silver/Gold  [📋]         │
-      │              │                    │ Iceberg 테이블                    │
-      │              │                    │ (Hadoop 카탈로그, 새 컨테이너 없음)  │
-      │              │                    │ df.writeTo(...).append()          │
+      │              │                    │ MinIO — Silver (Iceberg)  [⬜]    │
+      │              │                    │ lake.db.flight_features          │
+      │              │                    │ Hadoop 카탈로그(새 컨테이너 없음)   │
+      │              │                    │ PARTITIONED BY (event_date)      │
+      │              │                    │ .overwritePartitions() ← 멱등     │
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ DuckDB  [📋] — 저장 아님, 조회 창구  │
+      │              │                    │ Gold(집계) → DuckDB  [⬜ 0-6c]     │
+      │              │                    │ DuckDB는 저장이 아니라 조회 창구     │
       │              │                    │ iceberg_scan()으로 그 자리에서 읽음  │
       │              │                    │ (새 컨테이너 없음, 임베디드)          │
       │              │                    └───────────────┬───────────────────┘
@@ -69,3 +77,9 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
                 ▼
         WebSocket 브로드캐스트 → flight-ui (React/Leaflet)  [✅]
 ```
+
+**범례** — `[✅]` 구현·검증 완료 / `[⬜]` 미구현
+
+Hot Path는 상시 가동 중입니다. Cold Path의 Bronze 적재까지가 가동 중이고, **Bronze → Silver 배치 ETL은 구현과 검증을 마쳤지만 아직 실제로 돌리지 않았습니다** — DAG가 `paused` 상태이고 Iceberg 테이블도 아직 만들어지지 않았습니다. Gold·DuckDB·ML은 미구현입니다.
+
+상세한 작업 순서와 상태는 `docs/TASK_ORDER.md`, 모든 Before/After 측정치는 `docs/BENCHMARKS.md`에 있습니다.
