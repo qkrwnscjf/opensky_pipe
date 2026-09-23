@@ -105,20 +105,82 @@ kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 #
 # 대가: 새 데이터가 없을 때 fetch가 50ms 만에 빈 응답으로 돌아온다. 태스크가 도는
 # 동안에만 생기므로 브로커 부하는 무시할 수준이다.
-df_raw = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", kafka_bootstrap) \
-    .option("subscribe", "flight_data_raw") \
-    .option("startingOffsets", "earliest") \
-    .option("failOnDataLoss", "false") \
-    .option("maxOffsetsPerTrigger", os.getenv("KAFKA_MAX_OFFSETS", "500")) \
-    .option("kafka.fetch.max.wait.ms", os.getenv("KAFKA_FETCH_MAX_WAIT_MS", "50")) \
-    .load()
+# 【핫·콜드가 소스를 따로 잡는 이유】 (2026-09-23, 작업 순서 0-6b)
+#
+# 이전에는 readStream이 **하나**였고 두 writeStream이 그것을 공유했다. 그래서
+# maxOffsetsPerTrigger도 값이 하나뿐이었는데, **상한은 트리거마다 적용된다.**
+# 같은 500이 트리거 길이에 따라 전혀 다른 처리량 제한이 된다:
+#
+#   핫  (3초)   500 / 3초   = 166행/s   ← 생산 10행/s의 17배, 사실상 무제한
+#   콜드(120초)  500 / 120초 = 4.17행/s ← 생산 10행/s의 0.4배, **구조적 병목**
+#
+# 40배 비대칭이다. 2026-09-22 실측으로 이게 이론이 아님을 확인했다:
+#   - 콜드 배치 20/20건 전부 상한 포화(497~498행). 한 번도 따라잡은 적 없음
+#   - 랙이 7,323 → 8,363 → 11,138로 단조 증가 (약 +4.8행/s)
+#   - Bronze가 스트림의 47.2%만 담음. 나머지는 세션 종료 시 영구 손실
+#   - 그런데 콜드는 트리거 창의 **1.09%만 쓰고 98.9%를 놀고 있었다**
+#     (triggerExecution p50 1,308ms / 120,000ms)
+# 즉 막은 것은 용량이 아니라 상한이었다.
+#
+# 500이라는 값 자체는 A-3(2026-09-10)에서 "정상 max 91행 대비 5.5배 여유"로
+# 정했는데, 그 91행은 **핫 패스 3초 배치**의 크기다. 콜드의 120초 창은 산정에
+# 들어가지 않았다. 당시 기록은 부작용을 "콜드는 백로그 구간에서 파일이 더 잘게
+# 쪼개진다" 정도로 봤으나, 실제 결과는 파일 크기가 아니라 처리량 천장이었다.
+#
+# 값을 하나 올리는 것(공유 상한 상향)으로도 당장은 풀리지만, "값 하나가 40배
+# 다른 두 창에 적용된다"는 구조가 남아 트리거를 다시 조정하면 조용히 재발한다.
+# 그래서 소스를 쿼리별로 분리한다.
+#
+# **런타임 비용은 없다.** Structured Streaming은 writeStream마다 독립된 Kafka
+# 컨슈머를 쓰므로, 분리 전에도 이미 토픽을 두 번 읽고 있었다. 늘어나는 것은
+# 파싱 체인 정의가 두 벌이 되는 코드 비용뿐이다.
+def kafka_source(max_offsets):
+    """Kafka 소스를 만든다. 상한만 호출자가 정하고 나머지는 두 쿼리가 동일하다."""
+    return spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", kafka_bootstrap) \
+        .option("subscribe", "flight_data_raw") \
+        .option("startingOffsets", "earliest") \
+        .option("failOnDataLoss", "false") \
+        .option("maxOffsetsPerTrigger", max_offsets) \
+        .option("kafka.fetch.max.wait.ms", os.getenv("KAFKA_FETCH_MAX_WAIT_MS", "50")) \
+        .load()
+
+
+# 핫: 기존 값을 그대로 둔다. 3초 창에서 166행/s라 평상시를 조이지 않으면서,
+# 다운타임 뒤 재기동 때 2,742행짜리 배치(2026-09-10 실측)는 여전히 잘라낸다.
+HOT_MAX_OFFSETS = os.getenv("KAFKA_MAX_OFFSETS", "500")
+
+# 콜드: 120초 창에 맞춰 따로 잡는다.
+#
+# 하한은 "생산을 따라잡는 것"이 아니라 "밀린 것을 줄이는 것"이어야 한다. 생산과
+# 같으면 한 번 생긴 랙이 영원히 안 줄어든다. 주간 실트래픽 약 10행/s 기준
+# 유지선이 120초 × 10 = 1,200행이므로, 배수 여유를 둬 5,000으로 잡는다.
+#
+# 상한을 아예 없애지 않는 이유는 A-4(메모리)다. spark는 mem_limit 2g이고
+# 2026-09-09에 OOM(exit 137) 전례가 있다. 5,000은 근거 없는 값이 아니라
+# 2026-09-08 실측에서 콜드가 무리 없이 쓰던 배치 크기(300초 트리거, 파일 평균
+# 330KB ≈ 6,300행)보다 작다 — 이미 감당해 본 규모 안쪽이다.
+#
+# B-1(아시아 확장)으로 트래픽이 수십 배가 되면 이 값도 재산정해야 한다.
+COLD_MAX_OFFSETS = os.getenv("KAFKA_MAX_OFFSETS_COLD", "5000")
+
+df_raw_hot = kafka_source(HOT_MAX_OFFSETS)
+df_raw_cold = kafka_source(COLD_MAX_OFFSETS)
+print(f"KAFKA_SOURCE_LIMITS: hot={HOT_MAX_OFFSETS}/trigger cold={COLD_MAX_OFFSETS}/trigger")
 
 # ---------------------------------------------------------------
 # 4. 데이터 가공 (Postgres 형식에 맞게 변환)
 # ---------------------------------------------------------------
-df_parsed = df_raw.select(from_json(col("value").cast("string"), schema).alias("data")).select("data.*")
+def parse_and_flag(df_raw):
+    """Kafka raw → 스키마 적용 → timestamp 변환 → _valid 플래그.
+
+    소스가 둘로 나뉘었으므로(0-6b) 가공도 두 번 적용된다. 두 벌이 갈라지지
+    않도록 함수로 묶는다 — 여기가 유일한 정의다.
+    """
+    df_parsed = df_raw.select(
+        from_json(col("value").cast("string"), schema).alias("data")
+    ).select("data.*")
 
 # timestamp(Long)를 timestamp_ts(Timestamp)로 변환 후, 원래의 timestamp 컬럼을 대체
 #
@@ -132,20 +194,30 @@ df_parsed = df_raw.select(from_json(col("value").cast("string"), schema).alias("
 #    날짜 파티션 정확성이 콜드 패스의 유일한 요구사항이므로 직접적인 위협이다.
 #
 # 그래서 timestamp null도 유효성 조건에 넣고, 드롭을 save_to_hot에서 사유별로 센다.
-df_flagged = df_parsed \
-    .withColumn("timestamp_fixed", to_timestamp(from_unixtime(col("timestamp")))) \
-    .drop("timestamp") \
-    .withColumnRenamed("timestamp_fixed", "timestamp") \
-    .withColumn(
-        "_valid",
-        col("latitude").isNotNull()
-        & col("longitude").isNotNull()
-        & col("timestamp").isNotNull(),
-    )
+    return df_parsed \
+        .withColumn("timestamp_fixed", to_timestamp(from_unixtime(col("timestamp")))) \
+        .drop("timestamp") \
+        .withColumnRenamed("timestamp_fixed", "timestamp") \
+        .withColumn(
+            "_valid",
+            col("latitude").isNotNull()
+            & col("longitude").isNotNull()
+            & col("timestamp").isNotNull(),
+        )
 
-# 콜드 패스는 네이티브 parquet 싱크라 foreachBatch가 없어 셀 수 없다. 카운트는
-# 핫 패스에서만 하되, 두 쿼리가 같은 소스를 보므로 그 수치가 콜드에도 그대로 해당한다.
-df_processed = df_flagged.filter(col("_valid")).drop("_valid")
+
+# 핫 쿼리용 — _valid를 그대로 들고 간다. save_to_hot이 드롭 사유를 세고 나서
+# 직접 필터링하기 때문이다.
+df_flagged = parse_and_flag(df_raw_hot)
+
+# 콜드 쿼리용 — 이미 걸러진 것을 받는다.
+#
+# 콜드 패스는 foreachBatch지만 드롭 카운트는 핫에서만 센다. 두 쿼리가 같은
+# 토픽을 보므로 그 수치가 콜드에도 그대로 해당한다. 단, 0-6b 이후로는 두 쿼리의
+# **진행 위치가 다를 수 있다**(콜드가 밀리면 같은 시점에 다른 구간을 처리한다).
+# 드롭 비율은 데이터의 성질이라 여전히 유효하지만, 절대 건수를 콜드에 그대로
+# 대입하면 안 된다.
+df_processed = parse_and_flag(df_raw_cold).filter(col("_valid")).drop("_valid")
 
 # ---------------------------------------------------------------
 # 5. 핵심 함수: 배치 처리 로직 (Dual Write)
