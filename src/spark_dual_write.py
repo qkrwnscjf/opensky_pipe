@@ -151,11 +151,13 @@ def kafka_source(max_offsets):
 # 다운타임 뒤 재기동 때 2,742행짜리 배치(2026-09-10 실측)는 여전히 잘라낸다.
 HOT_MAX_OFFSETS = os.getenv("KAFKA_MAX_OFFSETS", "500")
 
-# 콜드: 120초 창에 맞춰 따로 잡는다.
+# 콜드: 콜드 트리거 창에 맞춰 따로 잡는다.
 #
 # 하한은 "생산을 따라잡는 것"이 아니라 "밀린 것을 줄이는 것"이어야 한다. 생산과
 # 같으면 한 번 생긴 랙이 영원히 안 줄어든다. 주간 실트래픽 약 10행/s 기준
-# 유지선이 120초 × 10 = 1,200행이므로, 배수 여유를 둬 5,000으로 잡는다.
+# 유지선이 120초 트리거에서 1,200행이었고, 배수 여유를 둬 5,000으로 잡았다.
+# 트리거를 60초로 줄인 뒤(2026-09-23)에는 유지선이 600행이라 여유가 약 8배다
+# (실효 처리량 5,000 / 60초 = 83행/s).
 #
 # 상한을 아예 없애지 않는 이유는 A-4(메모리)다. spark는 mem_limit 2g이고
 # 2026-09-09에 OOM(exit 137) 전례가 있다. 5,000은 근거 없는 값이 아니라
@@ -788,7 +790,7 @@ cold_query = df_processed.writeStream \
     .foreachBatch(save_to_cold) \
     .outputMode("append") \
     .option("checkpointLocation", cold_checkpoint_dir) \
-    .trigger(processingTime=os.getenv("COLD_TRIGGER", "120 seconds")) \
+    .trigger(processingTime=os.getenv("COLD_TRIGGER", "60 seconds")) \
     .start()
 
 start_metrics_reporter(hot_query, label="hot")
