@@ -27,11 +27,10 @@ dags/flight_lakehouse_etl.py가 마커 파일을 비교해 고르고, 날짜마�
 import argparse
 import os
 import sys
-from datetime import datetime
 
-import boto3
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import lit
+
+from lakehouse_common import build_spark, validate_date, write_marker, write_partition
 
 # ---------------------------------------------------------------
 # 설정
@@ -39,76 +38,11 @@ from pyspark.sql.functions import col, lit
 # Bronze: 스트리밍 콜드 패스가 쓰는 곳 (spark_dual_write.py의 MINIO_COLD_PATH와 같은 값)
 BRONZE_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/positions")
 # Silver: Iceberg 테이블. Hadoop 카탈로그라 warehouse 아래 디렉터리로 존재한다.
-ICEBERG_WAREHOUSE = os.getenv("ICEBERG_WAREHOUSE", "s3a://flight-data-lake/warehouse")
+# SparkSession·카탈로그 설정은 Gold와 같아야 하므로 lakehouse_common.py에 있다.
 SILVER_TABLE = os.getenv("SILVER_TABLE", "lake.db.flight_features")
 
 # 마커. DAG가 "이 날짜는 이미 했다"를 판단하는 유일한 근거다.
-LAKE_BUCKET = os.getenv("LAKE_BUCKET", "flight-data-lake")
 MARKER_PREFIX = os.getenv("ETL_MARKER_PREFIX", "etl_markers")
-
-minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
-minio_access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-minio_secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-
-
-def build_spark(app_name):
-    """S3A + Iceberg 설정을 얹은 SparkSession.
-
-    S3A 설정은 spark_dual_write.py와 같은 값이다. 두 잡이 같은 MinIO를 본다.
-
-    Iceberg 쪽은 카탈로그 `lake` 하나만 등록한다. type=hadoop이라 별도 카탈로그
-    서버(Hive Metastore, REST, Nessie)가 필요 없고, 메타데이터가 warehouse 경로
-    안의 파일로만 존재한다 — 컨테이너를 늘리지 않겠다는 제약(0-6)에 맞다.
-
-    Hadoop 카탈로그의 알려진 한계: 커밋이 "원자적 rename"에 기대는데 S3에는 그런
-    연산이 없다. 동시에 두 writer가 같은 테이블에 커밋하면 한쪽을 덮어쓸 수 있다.
-    여기서는 writer가 이 배치 하나뿐이고 DAG가 날짜당 한 태스크만 띄우므로 해당
-    조건이 성립하지 않는다. 동시 쓰기가 생기면 카탈로그를 바꿔야 한다.
-    """
-    return (
-        SparkSession.builder.appName(app_name)
-        .config("spark.hadoop.fs.s3a.endpoint", minio_endpoint)
-        .config("spark.hadoop.fs.s3a.access.key", minio_access_key)
-        .config("spark.hadoop.fs.s3a.secret.key", minio_secret_key)
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        .config("spark.hadoop.fs.s3a.connection.timeout", "60000")
-        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "5000")
-        .config(
-            "spark.sql.extensions",
-            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-        )
-        .config("spark.sql.catalog.lake", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lake.type", "hadoop")
-        .config("spark.sql.catalog.lake.warehouse", ICEBERG_WAREHOUSE)
-        .getOrCreate()
-    )
-
-
-def s3_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=minio_endpoint,
-        aws_access_key_id=minio_access_key,
-        aws_secret_access_key=minio_secret_key,
-    )
-
-
-def write_marker(date_str, row_count):
-    """`etl_markers/dt=<날짜>/_SUCCESS`를 남긴다.
-
-    내용은 진단용이다. DAG는 객체의 **존재 여부**만 본다.
-    """
-    key = f"{MARKER_PREFIX}/dt={date_str}/_SUCCESS"
-    body = (
-        f"date={date_str}\n"
-        f"rows={row_count}\n"
-        f"table={SILVER_TABLE}\n"
-        f"completed_at={datetime.utcnow().isoformat()}Z\n"
-    )
-    s3_client().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body.encode("utf-8"))
-    print(f"ETL_MARKER_WRITTEN: s3://{LAKE_BUCKET}/{key}")
 
 
 def main():
@@ -116,9 +50,7 @@ def main():
     parser.add_argument("--date", required=True, help="처리할 날짜 (YYYY-MM-DD)")
     args = parser.parse_args()
 
-    # 이 값은 그대로 경로와 파티션 값이 된다. 형식이 틀리면 조용히 빈 경로를
-    # 읽고 "데이터 없음"으로 끝나므로, 여기서 먼저 깨뜨린다.
-    datetime.strptime(args.date, "%Y-%m-%d")
+    validate_date(args.date)
 
     date_str = args.date
     source = f"{BRONZE_PATH}/dt={date_str}"
@@ -176,24 +108,14 @@ def main():
             df_silver = df_silver.drop("dt")
 
         # ── 4. Silver 쓰기 ───────────────────────────────────────
-        spark.sql("CREATE NAMESPACE IF NOT EXISTS lake.db")
-
-        if spark.catalog.tableExists(SILVER_TABLE):
-            # 이 DataFrame에 있는 파티션(= event_date 하루)만 교체한다.
-            # 다른 날짜 파티션은 건드리지 않는다.
-            df_silver.writeTo(SILVER_TABLE).overwritePartitions()
-            print(f"ETL_WRITE: overwritePartitions event_date={date_str} rows={dedup_count}")
-        else:
-            # 최초 1회. 파티션 명세는 테이블 속성이라 여기서만 정해진다.
-            #
-            # Iceberg는 hidden partitioning이다 — 조회 시 event_date 컬럼으로
-            # 그냥 WHERE를 걸면 되고, 디렉터리 구조를 쿼리에 드러낼 필요가 없다.
-            df_silver.writeTo(SILVER_TABLE).partitionedBy(col("event_date")).create()
-            print(f"ETL_CREATE: {SILVER_TABLE} created, event_date={date_str} rows={dedup_count}")
+        # 이 DataFrame에 있는 파티션(= event_date 하루)만 교체한다. 테이블이
+        # 없으면 event_date 파티션 명세로 만든다(lakehouse_common.write_partition).
+        mode = write_partition(df_silver, SILVER_TABLE, "event_date")
+        print(f"ETL_WRITE: {mode} {SILVER_TABLE} event_date={date_str} rows={dedup_count}")
 
         # ── 5. 마커 ─────────────────────────────────────────────
         # 반드시 쓰기 성공 뒤. 위에서 예외가 나면 여기 도달하지 않는다.
-        write_marker(date_str, dedup_count)
+        write_marker(MARKER_PREFIX, date_str, dedup_count, SILVER_TABLE)
         print(f"ETL_DONE: date={date_str} rows={dedup_count}")
 
     finally:

@@ -57,7 +57,22 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ Gold(집계) → DuckDB  [⬜ 0-6c]     │
+      │              │                    │ Gold 배치  [✅ 검증]               │
+      │              │                    │ spark_gold_etl.py --date <날짜>   │
+      │              │                    │ (icao24, time_position)로 재중복제거│
+      │              │                    │ 전날(D-1)을 맥락으로 읽어 자정 연결  │
+      │              │                    │ 300초 공백 기준 비행 구간 분할       │
+      │              │                    └───────────────┬───────────────────┘
+      │              │                                    ▼
+      │              │                    ┌───────────────────────────────┐
+      │              │                    │ MinIO — Gold (Iceberg)  [⬜]      │
+      │              │                    │ gold_flight_trajectory  (ML)     │
+      │              │                    │ gold_aircraft_daily     (DA)     │
+      │              │                    │ gold_traffic_hourly     (DA)     │
+      │              │                    └───────────────┬───────────────────┘
+      │              │                                    ▼
+      │              │                    ┌───────────────────────────────┐
+      │              │                    │ DuckDB  [⬜]                      │
       │              │                    │ DuckDB는 저장이 아니라 조회 창구     │
       │              │                    │ iceberg_scan()으로 그 자리에서 읽음  │
       │              │                    │ (새 컨테이너 없음, 임베디드)          │
@@ -78,8 +93,8 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
         WebSocket 브로드캐스트 → flight-ui (React/Leaflet)  [✅]
 ```
 
-**범례** — `[✅]` 구현·검증 완료 / `[⬜]` 미구현
+**범례** — `[✅]` 구현·검증 완료 / `[⬜]` 미구현(또는 테이블 미생성)
 
-Hot Path는 상시 가동 중입니다. Cold Path의 Bronze 적재까지가 가동 중이고, **Bronze → Silver 배치 ETL은 구현과 검증을 마쳤지만 아직 실제로 돌리지 않았습니다** — DAG가 `paused` 상태이고 Iceberg 테이블도 아직 만들어지지 않았습니다. Gold·DuckDB·ML은 미구현입니다.
+Hot Path는 상시 가동 중입니다. Cold Path의 Bronze 적재까지가 가동 중이고, **Bronze → Silver → Gold 배치 ETL은 구현과 검증을 마쳤지만 아직 실제로 돌리지 않았습니다** — DAG가 `paused` 상태이고 Iceberg 테이블(`[⬜]`)도 아직 만들어지지 않았습니다. DuckDB·ML은 미구현입니다.
 
 상세한 작업 순서와 상태는 `docs/TASK_ORDER.md`, 모든 Before/After 측정치는 `docs/BENCHMARKS.md`에 있습니다.

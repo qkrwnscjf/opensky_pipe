@@ -1,4 +1,11 @@
-"""Bronze → Silver 배치 ETL의 스케줄러. docs/TASK_ORDER.md 0-6 구현.
+"""Bronze → Silver → Gold 배치 ETL의 스케줄러. docs/TASK_ORDER.md 0-6 구현.
+
+  build_silver_commands → run_silver_for_date (날짜별, Bronze → Silver)
+                                   ↓ (전부 끝난 뒤)
+  build_gold_commands   → run_gold_for_date   (날짜별, Silver → Gold)
+
+두 단계는 마커를 따로 둔다(etl_markers/, etl_markers_gold/). 그래서 Silver만 끝나고
+Gold가 실패한 날짜도 다음 실행에서 Gold만 따라잡는다.
 
 【이 DAG가 푸는 문제】
 
@@ -45,7 +52,10 @@ LAKE_BUCKET = os.getenv("LAKE_BUCKET", "flight-data-lake")
 # spark_batch_etl.py의 BRONZE_PATH와 같은 위치를 가리켜야 한다. 저쪽은 s3a:// URI,
 # 여기는 boto3라 버킷과 접두사로 나눠 쓴다.
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "positions")
+# 단계별 완료 마커. 스크립트 쪽 기본값과 같아야 한다
+# (spark_batch_etl.MARKER_PREFIX, spark_gold_etl.GOLD_MARKER_PREFIX).
 MARKER_PREFIX = os.getenv("ETL_MARKER_PREFIX", "etl_markers")
+GOLD_MARKER_PREFIX = os.getenv("GOLD_MARKER_PREFIX", "etl_markers_gold")
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
@@ -108,15 +118,17 @@ def _dates_under(client, prefix):
     return dates
 
 
-def _completed_dates(client):
+def _completed_dates(client, marker_prefix):
     """마커가 **완결된** 날짜만 센다.
 
     dt= 디렉터리의 존재가 아니라 그 안의 _SUCCESS 객체의 존재를 본다. 마커를
     쓰다 만 상태(디렉터리만 있고 객체 없음)를 완료로 오인하지 않기 위해서다.
+
+    접두사 끝에 "/"를 붙여 나열하므로 etl_markers/와 etl_markers_gold/가 섞이지 않는다.
     """
     dates = set()
     paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=f"{MARKER_PREFIX}/"):
+    for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=f"{marker_prefix}/"):
         for obj in page.get("Contents", []):
             parts = obj["Key"].split("/")
             if len(parts) >= 3 and parts[-1] == "_SUCCESS" and parts[-2].startswith("dt="):
@@ -124,9 +136,39 @@ def _completed_dates(client):
     return dates
 
 
+def _pending(marker_prefix, label):
+    """Bronze에 있는 날짜 − 이 단계의 마커가 있는 날짜 − 오늘.
+
+    Silver와 Gold가 **같은 Bronze 날짜 집합**을 기준으로 삼는다. Gold를 Silver 마커
+    기준으로 고르면, 이번 실행에서 막 Silver를 처리할 날짜가 아직 마커가 없어 Gold
+    대상에서 빠진다(하루 늦게 따라잡게 됨). Bronze 기준이면 같은 실행 안에서 둘 다 된다.
+    """
+    client = _s3()
+    bronze = _dates_under(client, BRONZE_PREFIX)
+    done = _completed_dates(client, marker_prefix)
+
+    # 오늘은 아직 수집 중이라 제외한다. 일부만 담긴 파티션에 마커가 붙으면
+    # 그날의 나머지가 영구 누락된다.
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    pending = sorted(d for d in (bronze - done) if d < today)
+
+    print(f"[{label}] BRONZE_DATES: {sorted(bronze)}")
+    print(f"[{label}] COMPLETED_DATES: {sorted(done)}")
+    print(f"[{label}] PENDING_DATES: {pending}")
+    return pending
+
+
+def _spark_submit(script, date):
+    return (
+        "/home/airflow/.local/bin/spark-submit "
+        f"--packages {SPARK_PACKAGES} "
+        f"/opt/airflow/src/{script} --date {date}"
+    )
+
+
 with DAG(
     dag_id="flight_lakehouse_etl",
-    description="Bronze(Parquet) → Silver(Iceberg) 일배치 ETL",
+    description="Bronze(Parquet) → Silver(Iceberg) → Gold(Iceberg) 일배치 ETL",
     default_args=default_args,
     # 매일 01:00 UTC. 어제 날짜가 완전히 닫힌 뒤에 돈다.
     schedule_interval="0 1 * * *",
@@ -138,43 +180,44 @@ with DAG(
     # 앞 실행이 아직 밀린 날짜를 돌고 있는데 다음 스케줄이 겹쳐 같은 날짜를
     # 두 번 처리하는 것을 막는다.
     max_active_runs=1,
-    tags=["lakehouse", "cold-path", "silver"],
+    tags=["lakehouse", "cold-path", "silver", "gold"],
 ) as dag:
 
+    # Spark를 띄우지 않고 S3 나열만 한다 — 처리할 날짜가 없는 날(대부분)에
+    # JVM을 띄우지 않기 위해서다. 반환이 빈 리스트면 매핑 태스크는 인스턴스 0개로 skip된다.
     @task
-    def build_etl_commands() -> list:
-        """처리할 날짜를 찾아 날짜별 spark-submit 명령 문자열을 만든다.
+    def build_silver_commands() -> list:
+        return [_spark_submit("spark_batch_etl.py", d) for d in _pending(MARKER_PREFIX, "silver")]
 
-        Spark를 띄우지 않고 S3 나열만 한다 — 처리할 날짜가 없는 날(대부분)에
-        JVM을 띄우지 않기 위해서다.
-        """
-        client = _s3()
-        bronze = _dates_under(client, BRONZE_PREFIX)
-        done = _completed_dates(client)
-
-        # 오늘은 아직 수집 중이라 제외한다. 일부만 담긴 파티션에 마커가 붙으면
-        # 그날의 나머지가 영구 누락된다.
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        pending = sorted(d for d in (bronze - done) if d < today)
-
-        print(f"BRONZE_DATES: {sorted(bronze)}")
-        print(f"COMPLETED_DATES: {sorted(done)}")
-        print(f"PENDING_DATES: {pending}")
-
-        # 반환이 빈 리스트면 아래 매핑 태스크는 인스턴스 0개로 skip된다.
-        return [
-            "/home/airflow/.local/bin/spark-submit "
-            f"--packages {SPARK_PACKAGES} "
-            f"/opt/airflow/src/spark_batch_etl.py --date {d}"
-            for d in pending
-        ]
+    @task
+    def build_gold_commands() -> list:
+        return [_spark_submit("spark_gold_etl.py", d) for d in _pending(GOLD_MARKER_PREFIX, "gold")]
 
     # 날짜 하나당 태스크 하나(동적 태스크 매핑). 한 잡이 여러 날짜를 처리하지
     # 않게 쪼개는 이유: 3일치 중 2일차에서 실패해도 1일차의 마커는 이미 남아
     # 재실행 때 다시 하지 않는다. 실패의 영향 범위가 하루로 갇힌다.
-    run_etl = BashOperator.partial(
-        task_id="run_etl_for_date",
-        # 밀린 날짜가 여러 개여도 Spark 드라이버는 한 번에 하나만 뜬다.
-        # 로컬 메모리 한계(spark 서비스 mem_limit 2g와 같은 호스트)를 고려한 값.
+    #
+    # max_active_tis_per_dag=1: 밀린 날짜가 여러 개여도 Spark 드라이버는 한 번에
+    # 하나만 뜬다. 로컬 메모리 한계(spark 서비스 mem_limit 2g와 같은 호스트)와
+    # Hadoop 카탈로그의 단일 writer 전제를 함께 지킨다.
+    run_silver = BashOperator.partial(
+        task_id="run_silver_for_date",
         max_active_tis_per_dag=1,
-    ).expand(bash_command=build_etl_commands())
+    ).expand(bash_command=build_silver_commands())
+
+    # Gold는 **모든** Silver 태스크가 끝난 뒤에 돈다. 날짜 D의 Gold가 D-1의 Silver를
+    # 맥락으로 읽기 때문에, 날짜별로 Silver→Gold를 번갈아 돌리는 것보다 Silver를 먼저
+    # 다 채우는 편이 정확하다.
+    #
+    # trigger_rule="none_failed": Silver가 이미 다 끝나 있으면 run_silver는 인스턴스
+    # 0개로 skipped가 된다. 기본값(all_success)이면 그때 Gold까지 skip되어, "Silver는
+    # 됐는데 Gold가 실패한 날짜"를 영영 따라잡지 못한다. none_failed는 skipped는
+    # 통과시키고, Silver가 하나라도 실패하면 Gold를 막는다 — Silver가 불완전한 채로
+    # Gold를 만들지 않는다.
+    run_gold = BashOperator.partial(
+        task_id="run_gold_for_date",
+        max_active_tis_per_dag=1,
+        trigger_rule="none_failed",
+    ).expand(bash_command=build_gold_commands())
+
+    run_silver >> run_gold
