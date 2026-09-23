@@ -3,9 +3,11 @@
   build_silver_commands → run_silver_for_date (날짜별, Bronze → Silver)
                                    ↓ (전부 끝난 뒤)
   build_gold_commands   → run_gold_for_date   (날짜별, Silver → Gold)
+                                   ↓ (결과와 무관하게 끝난 뒤)
+  build_merge_commands  → run_bronze_merge_for_date (날짜별, Bronze 파일 병합)
 
-두 단계는 마커를 따로 둔다(etl_markers/, etl_markers_gold/). 그래서 Silver만 끝나고
-Gold가 실패한 날짜도 다음 실행에서 Gold만 따라잡는다.
+단계마다 마커를 따로 둔다(etl_markers/, etl_markers_gold/, etl_markers_bronze_merge/).
+그래서 한 단계만 실패한 날짜도 다음 실행에서 그 단계만 따라잡는다.
 
 【이 DAG가 푸는 문제】
 
@@ -56,6 +58,7 @@ BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "positions")
 # (spark_batch_etl.MARKER_PREFIX, spark_gold_etl.GOLD_MARKER_PREFIX).
 MARKER_PREFIX = os.getenv("ETL_MARKER_PREFIX", "etl_markers")
 GOLD_MARKER_PREFIX = os.getenv("GOLD_MARKER_PREFIX", "etl_markers_gold")
+MERGE_MARKER_PREFIX = os.getenv("BRONZE_MERGE_MARKER_PREFIX", "etl_markers_bronze_merge")
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
@@ -158,6 +161,26 @@ def _pending(marker_prefix, label):
     return pending
 
 
+def _pending_merge():
+    """병합 대상 = Silver 마커가 있는 날짜 − 병합 마커가 있는 날짜 − 오늘.
+
+    Bronze 기준이 아니라 **Silver 완료** 기준이다. Silver가 그 날짜의 Bronze를 다
+    읽었다는 것이 병합해도 되는 조건이기 때문이다. 오늘은 스트리밍이 아직 쓰고 있다.
+    Bronze 디렉터리가 실제로 남아 있는 날짜로 한 번 더 좁힌다.
+    """
+    client = _s3()
+    bronze = _dates_under(client, BRONZE_PREFIX)
+    silver_done = _completed_dates(client, MARKER_PREFIX)
+    merged = _completed_dates(client, MERGE_MARKER_PREFIX)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    pending = sorted(d for d in ((silver_done & bronze) - merged) if d < today)
+
+    print(f"[merge] SILVER_DONE: {sorted(silver_done)}")
+    print(f"[merge] MERGED: {sorted(merged)}")
+    print(f"[merge] PENDING_DATES: {pending}")
+    return pending
+
+
 def _spark_submit(script, date):
     return (
         "/home/airflow/.local/bin/spark-submit "
@@ -180,7 +203,7 @@ with DAG(
     # 앞 실행이 아직 밀린 날짜를 돌고 있는데 다음 스케줄이 겹쳐 같은 날짜를
     # 두 번 처리하는 것을 막는다.
     max_active_runs=1,
-    tags=["lakehouse", "cold-path", "silver", "gold"],
+    tags=["lakehouse", "cold-path", "silver", "gold", "bronze-merge"],
 ) as dag:
 
     # Spark를 띄우지 않고 S3 나열만 한다 — 처리할 날짜가 없는 날(대부분)에
@@ -220,4 +243,24 @@ with DAG(
         trigger_rule="none_failed",
     ).expand(bash_command=build_gold_commands())
 
-    run_silver >> run_gold
+    # Bronze 병합. Gold 뒤에 한 줄로 잇는 이유: max_active_tis_per_dag=1은 **태스크
+    # 하나 단위** 제한이라, 병합을 Silver 바로 뒤에 두면 Gold와 동시에 돌아 Spark가
+    # 두 개 뜬다. 한 줄로 이어야 "Spark는 한 번에 하나"가 지켜진다.
+    #
+    # 대상 목록을 Gold가 끝난 **뒤에** 만든다. 시작 시점에 만들면 이번 실행에서 막
+    # Silver가 끝난 날짜가 아직 마커가 없어 빠지고, 병합이 하루 늦어진다.
+    #
+    # trigger_rule="all_done": 병합은 Gold의 성공과 무관하다(Gold는 Bronze를 읽지
+    # 않는다). 대상을 "Silver 마커가 있는 날짜"로 골라 두었으므로, 앞 단계가 일부
+    # 실패했어도 병합해도 되는 날짜만 처리된다.
+    @task(trigger_rule="all_done")
+    def build_merge_commands() -> list:
+        return [_spark_submit("bronze_merge.py", d) for d in _pending_merge()]
+
+    merge_commands = build_merge_commands()
+    run_merge = BashOperator.partial(
+        task_id="run_bronze_merge_for_date",
+        max_active_tis_per_dag=1,
+    ).expand(bash_command=merge_commands)
+
+    run_silver >> run_gold >> merge_commands
