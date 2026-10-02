@@ -48,3 +48,18 @@ RUN pip install --no-cache-dir \
     pandas \
     python-dotenv \
     boto3
+
+# 5. 레이크 조회(DuckDB)와 ML 학습(scikit-learn) — 0-6d
+#
+# 위 설치 줄에 섞지 않고 따로 둔다. 위 줄을 고치면 그 층의 캐시가 깨져 pyspark(수백 MB)까지
+# 다시 받는다.
+#
+# 버전은 이 이미지의 Python 3.8에서 설치되는 마지막 대에 맞춘다(apache/airflow:2.8.1 기본
+# 파이썬). scikit-learn은 1.3.x가 3.8을 지원하는 마지막 버전이다.
+#
+# DuckDB 확장(httpfs: MinIO/S3 읽기, iceberg: Iceberg 메타데이터 해석)은 빌드 때 미리 받아 둔다.
+# 실행할 때마다 인터넷에서 확장을 내려받지 않게 하기 위해서다.
+RUN pip install --no-cache-dir \
+    duckdb==1.1.3 \
+    scikit-learn==1.3.2 \
+  && python -c "import duckdb; duckdb.sql('INSTALL httpfs'); duckdb.sql('INSTALL iceberg')"
