@@ -63,3 +63,31 @@ RUN pip install --no-cache-dir \
     duckdb==1.1.3 \
     scikit-learn==1.3.2 \
   && python -c "import duckdb; duckdb.sql('INSTALL httpfs'); duckdb.sql('INSTALL iceberg')"
+
+# 6. Spark 의존 라이브러리를 이미지에 미리 받아 둔다 — 0-6i (2026-10-02, 사용자 결정)
+#
+# spark-submit --packages는 컨테이너가 새로 만들어질 때마다 Maven에서 라이브러리를 다시
+# 받는다. 2026-10-02 실측: 기동 직후 배치 태스크가 255초, 스트리밍 컨테이너가 276초를
+# 같은 시각에 다운로드로 썼다(대부분 AWS SDK 번들 약 280MB). 세션마다 4~5분과 약 0.6GB
+# 네트워크를 쓰고, 그동안 Maven 저장소가 막히면 파이프라인이 뜨지 않는다.
+#
+# 빌드 때 빈 스크립트로 spark-submit을 한 번 돌려 Ivy 캐시(~/.ivy2/cache)를 채운다. 실행 시
+# 같은 --packages 좌표는 캐시에서 해석되어 다운로드가 일어나지 않는다. 런타임 동작과
+# 메모리 사용량은 그대로다 — 같은 파일을 어디서 가져오느냐만 바뀐다.
+#
+# ~/.ivy2/jars는 지운다. Ivy가 캐시의 파일을 그 폴더로 한 번 더 복사해 두는데, 실행 시
+# 캐시에서 다시 복사(로컬, 수 초)되므로 이미지에 두 벌을 남길 이유가 없다.
+#
+# 좌표는 아래 두 곳과 같아야 캐시가 쓰인다. 어긋나면 그 라이브러리만 실행 시 다시 받는다
+# (동작은 하지만 느려진다):
+#   docker-compose.yml  spark 서비스의 --packages (스트리밍)
+#   dags/flight_lakehouse_etl.py  SPARK_PACKAGES (배치)
+#
+# 이 단계를 맨 뒤에 두는 이유: 기존 레이어를 그대로 재사용해, 다시 빌드해도 이전 이미지가
+# 디스크를 거의 차지하지 않게 하기 위해서다.
+RUN touch /tmp/noop.py \
+  && /home/airflow/.local/bin/spark-submit \
+       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.6.0,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1 \
+       /tmp/noop.py \
+  && rm /tmp/noop.py \
+  && rm -r /home/airflow/.ivy2/jars
