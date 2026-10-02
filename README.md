@@ -31,17 +31,17 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
    │    icao24, 조건절) │                    │ (영구 보관, at-least-once) │
    └────┬────────┬────┘                    └────────────┬──────────────┘
         │        │                                       │
-        ▼        ▼                                       │ ✅ 구현·검증 완료, 실운영 전
+        ▼        ▼                                       │ ✅ 09-29 첫 실운영
 ┌──────────┐ ┌──────────────┐                             ▼
 │flight_data│ │flight_current│            ┌───────────────────────────────┐
-│(이력, 1시간)│ │(상태, PK=    │            │ Airflow DAG  [✅ 검증 / paused]    │
+│(이력, 1시간)│ │(상태, PK=    │            │ Airflow DAG  [✅ 기동 시 자동 실행]  │
 │ pg_cron이  │ │ icao24)      │            │ flight_lakehouse_etl            │
 │ 매시 정리   │ │ 조건부 UPSERT │            │ "0 1 * * *" UTC, catchup=False  │
 └─────┬─────┘ └──────┬───────┘            │ Bronze dt= − 마커 − 오늘         │
       │              │                    │  → 날짜당 1태스크 동적 매핑        │
       │              │                    │ 순서: Silver → Gold → Bronze 병합  │
-      │              │                    │ (병합 [📋 구현, 미실행]: Silver가   │
-      │              │                    │  끝난 날짜의 파일을 하루 1개로)     │
+      │              │                    │ (병합 [✅]: Silver가 끝난 날짜의     │
+      │              │                    │  Bronze 파일을 하루 1개로)          │
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
@@ -52,7 +52,7 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ MinIO — Silver (Iceberg)  [⬜]    │
+      │              │                    │ MinIO — Silver (Iceberg)  [✅]    │
       │              │                    │ lake.db.flight_features          │
       │              │                    │ Hadoop 카탈로그(새 컨테이너 없음)   │
       │              │                    │ PARTITIONED BY (event_date)      │
@@ -68,22 +68,24 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ MinIO — Gold (Iceberg)  [⬜]      │
+      │              │                    │ MinIO — Gold (Iceberg)  [✅]      │
       │              │                    │ gold_flight_trajectory  (ML)     │
       │              │                    │ gold_aircraft_daily     (DA)     │
       │              │                    │ gold_traffic_hourly     (DA)     │
       │              │                    └───────────────┬───────────────────┘
       │              │                                    ▼
       │              │                    ┌───────────────────────────────┐
-      │              │                    │ DuckDB  [⬜]                      │
+      │              │                    │ DuckDB  [✅] lake_duckdb.py       │
       │              │                    │ DuckDB는 저장이 아니라 조회 창구     │
       │              │                    │ iceberg_scan()으로 그 자리에서 읽음  │
       │              │                    │ (새 컨테이너 없음, 임베디드)          │
       │              │                    └───────────────┬───────────────────┘
       │              │                              ┌───────┴───────┐
       │              │                              ▼               ▼
-      │              │                        DA 애드혹 분석    ML 학습 스크립트
-      │              │                                          (코드만, 미운영)
+      │              │                        DA 애드혹 분석    ML 학습 [✅ 검증]
+      │              │                        (예시 쿼리)      ml_train_trajectory.py
+      │              │                                         다음 위치 예측 → MinIO ml/
+      │              │                                         (수동 실행, 운용 안 함)
       ▼              ▼
 ┌─────────────────────────────────┐
 │ backend (FastAPI)  [✅]            │
@@ -96,8 +98,8 @@ Kafka, Spark, MinIO, PostgreSQL을 활용한 **실시간 항공 데이터 파이
         WebSocket 브로드캐스트 → flight-ui (React/Leaflet)  [✅]
 ```
 
-**범례** — `[✅]` 구현·검증 완료 / `[📋]` 구현했으나 미실행·미검증 / `[⬜]` 미구현(또는 테이블 미생성)
+**범례** — `[✅]` 구현·검증 완료
 
-Hot Path는 상시 가동 중입니다. Cold Path의 Bronze 적재까지가 가동 중이고, **Bronze → Silver → Gold 배치 ETL은 구현과 검증을 마쳤지만 아직 실제로 돌리지 않았습니다** — DAG가 `paused` 상태이고 Iceberg 테이블(`[⬜]`)도 아직 만들어지지 않았습니다. DuckDB·ML은 미구현입니다.
+Hot Path와 Cold Path의 Bronze 적재는 상시 가동됩니다. Bronze → Silver → Gold 배치와 Bronze 병합은 2026-09-29에 첫 실운영을 마쳤고, 스택을 띄우면 DAG가 켜진 채 등록되어 밀린 날짜를 자동으로 따라잡습니다. DuckDB는 Iceberg 테이블을 그 자리에서 조회하고, ML 파이프라인은 학습·평가·저장까지 동작을 확인했으며 실제 운용은 하지 않습니다.
 
 상세한 작업 순서와 상태는 `docs/TASK_ORDER.md`, 모든 Before/After 측정치는 `docs/BENCHMARKS.md`에 있습니다.
