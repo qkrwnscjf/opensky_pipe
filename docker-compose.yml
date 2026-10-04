@@ -375,6 +375,8 @@ services:
       - ./dags:/opt/airflow/dags
       - ./src:/opt/airflow/src
       - ./data:/opt/airflow/data
+      # ml_train_trajectory.py가 쓰는 화면용 리포트(ml_runs.json) — flight-ui가 정적 파일로 읽는다
+      - ./flight-ui/public/ml-report:/opt/airflow/ml_report
     depends_on:
       - airflow-postgres
       - kafka
@@ -394,6 +396,30 @@ services:
       - POSTGRES_DB=airflow
     ports:
       - "5433:5432"
+
+  # ML 모델 비교(기준선·HGB·Chronos-Bolt tiny) — 2026-10-04, 사용자 결정 A안
+  #
+  # 손으로 실행하는 일회성 작업이다. profile "ml"로 묶어 `docker compose up`에서는 뜨지
+  # 않는다. 포트를 열지 않는다. 실행:
+  #   docker compose run --rm ml
+  # Python 3.8인 airflow 이미지 대신 전용 이미지(Dockerfile.ml, Python 3.11 + PyTorch CPU)를
+  # 쓴다. 레이크(MinIO)는 읽고, 결과는 MinIO ml/model_comparison/과 화면용 리포트 폴더에 쓴다.
+  ml:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    image: airpipe-ml
+    profiles: ["ml"]
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_PASSWORD:-minioadmin}
+      - ML_REPORT_DIR=/app/ml_report
+    volumes:
+      - ./src:/app/src:ro
+      - ./flight-ui/public/ml-report:/app/ml_report
+    depends_on:
+      - minio
 
 volumes:
   # 유일한 영구 저장소. B-2(궤적 예측) 학습 데이터의 원천이므로 세션을 넘어

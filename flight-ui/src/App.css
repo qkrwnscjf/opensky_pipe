@@ -15,6 +15,10 @@
   --shadow-sm: 0 8px 20px rgba(16, 35, 80, 0.08);
   --chrome: #e9edf5;
   --chrome-border: #d5dded;
+  /* Model Report 시리즈 색 — dataviz 검증 통과(색각 이상 ΔE 24.7, 대비 ≥3:1, 흰 바탕) */
+  --series-model: #2a78d6;
+  --series-baseline: #eb6834;
+  --series-chronos: #1baf7a; /* 대비 2.82:1 — 막대 끝 수치 라벨로 보완(relief) */
   color-scheme: light;
 }
 
@@ -35,6 +39,10 @@
   --shadow-sm: 0 10px 24px rgba(0, 0, 0, 0.4);
   --chrome: #17223a;
   --chrome-border: #22304d;
+  /* 어두운 바탕(#0f1a2e)용으로 따로 고른 단계 — 검증 통과(ΔE 26.8, 대비 ≥3:1) */
+  --series-model: #3987e5;
+  --series-baseline: #d95926;
+  --series-chronos: #199e70;
   color-scheme: dark;
 }
 
@@ -726,6 +734,61 @@ body, html, #root {
 }
 
 
+/* 항공기 호버 툴팁 — Leaflet 기본 흰 박스를 테마 토큰으로 덮어쓴다 */
+.leaflet-tooltip.flight-tip {
+  background: var(--surface-alpha);
+  backdrop-filter: blur(10px);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+  padding: 8px 11px;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+.leaflet-tooltip-top.flight-tip::before {
+  border-top-color: var(--border);
+}
+
+.tip-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 0.85rem;
+}
+
+.tip-band {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.tip-icao {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tip-grid {
+  display: grid;
+  grid-template-columns: auto auto;
+  column-gap: 12px;
+  row-gap: 2px;
+  font-size: 0.75rem;
+}
+
+.tip-grid span {
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+.tip-grid b {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .aircraft-icon {
   position: relative;
   display: flex;
@@ -762,6 +825,23 @@ body, html, #root {
   border-radius: 999px;
   padding: 8px 8px 8px 16px;
   box-shadow: var(--shadow-sm);
+}
+
+.fleet-select {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 5px 10px;
+  max-width: 190px;
+  cursor: pointer;
+  outline: none;
+}
+
+.fleet-select:focus-visible {
+  border-color: var(--primary);
 }
 
 .fleet-search input {
@@ -893,6 +973,14 @@ body, html, #root {
   }
   .hero-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  /* 검색창 + 국가 필터 + 정렬이 한 줄에 안 들어가므로 줄바꿈 */
+  .fleet-search {
+    flex-wrap: wrap;
+    border-radius: 18px;
+  }
+  .fleet-search input {
+    width: 100%;
   }
 }
 
@@ -1266,3 +1354,491 @@ body, html, #root {
 [data-theme='dark'] .fleet-pinned-count {
   color: #fbbf24;
 }
+
+/* ================= Model Report (#/model) ================= */
+.live-view[hidden] {
+  display: none !important;
+}
+
+.nav-links a.active {
+  color: var(--primary);
+}
+
+.model-report {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 56px 24px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.mr-head h1 {
+  margin: 6px 0 10px;
+  font-size: clamp(1.8rem, 4vw, 2.6rem);
+  letter-spacing: -0.02em;
+}
+
+.mr-head p {
+  margin: 0;
+  max-width: 720px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.mr-ko {
+  /* 영어 본문 아래 짧은 한국어 요약 — 본문보다 한 단계 작고 흐리게 */
+  margin: 6px 0 14px;
+  max-width: 760px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  line-height: 1.55;
+  word-break: keep-all;
+}
+
+.mr-head .mr-ko {
+  margin-top: 12px;
+}
+
+.mr-card {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  box-shadow: var(--shadow-sm);
+  padding: 24px;
+}
+
+.mr-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.mr-card h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.mr-card-sub {
+  margin: 8px 0 18px;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.mr-meta {
+  margin-top: 16px;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+.mr-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--text-dim);
+}
+
+.mr-cmd {
+  margin: 12px auto 0;
+  text-align: left;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 0.78rem;
+  color: var(--text);
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* 범례·키 — 색은 표식에만, 글자는 텍스트 색 */
+.mr-legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
+.mr-key {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+
+.mr-key.model { background: var(--series-model); }
+.mr-key.baseline { background: var(--series-baseline); }
+.mr-key.chronos { background: var(--series-chronos); }
+
+/* ① 결론 */
+.mr-verdict-badge {
+  display: inline-block;
+  font-weight: 700;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.mr-verdict-badge.lose { color: var(--danger); }
+.mr-verdict-badge.win { color: var(--success); }
+
+.mr-verdict-figures {
+  display: flex;
+  align-items: flex-end;
+  gap: 28px;
+  margin: 18px 0 8px;
+  flex-wrap: wrap;
+}
+
+.mr-hero {
+  font-size: clamp(2.6rem, 7vw, 3.6rem);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.mr-hero span,
+.mr-kpi-value span {
+  font-size: 0.4em;
+  margin-left: 4px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.mr-hero-label {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.mr-vs {
+  color: var(--text-dim);
+  font-weight: 600;
+  padding-bottom: 22px;
+}
+
+.mr-verdict-text {
+  margin: 10px 0 0;
+  max-width: 760px;
+  line-height: 1.6;
+  font-size: 0.9rem;
+}
+
+/* ② 오차 막대 — 0 기준 공통 축, 얇은 막대, 끝만 둥글게, 값은 막대 끝에 텍스트 색으로 */
+.mr-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.mr-bar-group {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  column-gap: 20px;
+  row-gap: 2px;
+  align-items: center;
+}
+
+.mr-bar-group-label {
+  grid-row: span 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mr-bar-group-label b { font-size: 0.88rem; }
+.mr-bar-group-label span { font-size: 0.74rem; color: var(--text-dim); }
+
+.mr-bar-row {
+  position: relative;
+  padding: 4px 0; /* 막대보다 넓은 호버 영역 */
+  cursor: default;
+  transition: opacity 0.15s;
+}
+
+.mr-bar-row.dim { opacity: 0.45; }
+
+.mr-bar-track {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mr-bar {
+  height: 14px;
+  min-width: 2px;
+  border-radius: 0 4px 4px 0;
+}
+
+.mr-bar.model { background: var(--series-model); }
+.mr-bar.baseline { background: var(--series-baseline); }
+.mr-bar.chronos { background: var(--series-chronos); }
+
+.mr-bar-value {
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mr-tip {
+  position: absolute;
+  z-index: 5;
+  left: 0;
+  bottom: calc(100% + 4px);
+  background: var(--surface-alpha);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-sm);
+  padding: 7px 10px;
+  font-size: 0.76rem;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.mr-tip-title {
+  font-weight: 700;
+  margin-bottom: 3px;
+}
+
+/* ③ 신뢰도 */
+.mr-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.mr-kpi {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+
+.mr-kpi-value {
+  font-size: 1.7rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.mr-kpi-label {
+  margin-top: 2px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.mr-kpi-note {
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+/* ④ 모델 사양 */
+.mr-sub-h {
+  margin: 18px 0 6px;
+  font-size: 0.9rem;
+}
+
+.mr-spec {
+  margin-bottom: 8px;
+  overflow-x: auto;
+}
+
+.mr-spec-table th {
+  width: 190px;
+  color: var(--text-dim);
+  font-weight: 600;
+  vertical-align: top;
+}
+
+.mr-spec-table td {
+  white-space: normal;
+}
+
+/* ④ 특성 */
+.mr-features {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mr-feature {
+  font-size: 0.76rem;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  border: 1px solid var(--border);
+}
+
+/* ⑤ 실행 기록 */
+.mr-history-chart {
+  position: relative;
+  margin: 12px 0 8px;
+}
+
+.mr-history-chart svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.mr-grid { stroke: var(--border); stroke-width: 1; }
+.mr-axis { fill: var(--text-dim); font-size: 11px; }
+.mr-line { fill: none; stroke-width: 2; }
+.mr-line.model { stroke: var(--series-model); }
+.mr-line.baseline { stroke: var(--series-baseline); }
+.mr-dot { stroke: var(--surface); stroke-width: 2; }
+.mr-dot.model { fill: var(--series-model); }
+.mr-dot.baseline { fill: var(--series-baseline); }
+.mr-crosshair { stroke: var(--text-dim); stroke-width: 1; stroke-dasharray: 3 3; }
+.mr-hit { fill: transparent; }
+
+.mr-tip-chart {
+  top: 0;
+  bottom: auto;
+  transform: translateX(-50%);
+}
+
+.mr-table-wrap {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.mr-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.mr-table th,
+.mr-table td {
+  text-align: left;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.mr-table th {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 0.74rem;
+  letter-spacing: 0.03em;
+}
+
+.mr-table .num { text-align: right; }
+
+@media (max-width: 720px) {
+  .model-report { padding: 32px 16px; }
+  .mr-card { padding: 18px 16px; }
+  .mr-bar-group { grid-template-columns: 1fr; }
+  .mr-bar-group-label { grid-row: auto; margin-bottom: 4px; }
+  /* 좁은 화면에서도 Model 링크만은 보인다 (실시간 화면으로는 로고로 돌아감) */
+  .nav-links { display: flex; }
+  .nav-links a:not(.nav-model) { display: none; }
+}
+
+/* 같은 조건 비교 섹션 */
+.mr-rank {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 22px;
+}
+
+.mr-rank-item {
+  display: grid;
+  grid-template-columns: 22px 14px 1fr auto;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 2px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  font-size: 0.85rem;
+}
+
+.mr-rank-item.top {
+  border-color: var(--primary);
+}
+
+.mr-rank-no {
+  color: var(--text-dim);
+  font-weight: 700;
+}
+
+.mr-rank-delta {
+  grid-column: 3 / -1;
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+
+.mr-models {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  margin-bottom: 8px;
+}
+
+.mr-model {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: var(--bg-soft);
+}
+
+.mr-model-head {
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.mr-model dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 12px;
+  row-gap: 5px;
+  font-size: 0.78rem;
+}
+
+.mr-model dt {
+  color: var(--text-dim);
+}
+
+.mr-model dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 정확도 표 */
+.mr-acc-table td.best {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.mr-acc-table td:not(.best).num {
+  color: var(--text-dim);
+}
+
+.mr-acc-note {
+  margin-top: 10px;
+}
+
