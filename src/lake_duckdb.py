@@ -15,6 +15,13 @@ Hadoop 카탈로그는 테이블 폴더 안의 `metadata/version-hint.text`가 �
 가리킨다. DuckDB의 iceberg_scan('<테이블 폴더>')은 바로 이 규약을 따라 최신 스냅샷을 찾는다.
 카탈로그 서버(REST·Hive)가 필요했다면 Hadoop 카탈로그를 고를 수 없었다(0-6 논의 참고).
 
+【한국 시간(KST)은 조회할 때 변환한다】 (2026-10-03, 사용자 결정 — A안)
+레이크는 전부 UTC로 저장한다(Bronze dt, Silver·Gold event_date, gold_traffic_hourly.hour_utc).
+DAG의 날짜 선택과 Gold의 자정 이어 붙이기가 같은 UTC 날짜를 전제로 맞물려 있어서, 저장값을
+KST로 바꾸거나 KST 열을 추가하지 않는다. 한국 시간이 필요하면 쿼리에서 +9시간 한다 —
+예시의 "KST 시간대별 평균 교통량"이 그 패턴이다. 주의: UTC event_date 하루는 KST로는
+전날 09시~당일 09시라, KST 날짜로 묶으려면 event_date + hour_utc로 시각을 먼저 복원해야 한다.
+
 【쓰기는 하지 않는다】
 Iceberg 쓰기는 Spark 배치만 한다(Hadoop 카탈로그는 writer 하나를 전제한다). 여기서는
 읽기만 한다.
@@ -83,6 +90,21 @@ EXAMPLES = {
         SELECT event_date, hour_utc, origin_country, aircraft_count, airborne_aircraft, obs_count
         FROM {scan('traffic_hourly')}
         ORDER BY aircraft_count DESC
+        LIMIT 10
+    """,
+    "KST 시간대별 평균 교통량 (한국 시간 기준, 상위 10)": f"""
+        WITH per_hour AS (
+            SELECT event_date + to_hours(hour_utc + 9) AS kst_hour_start,
+                   sum(aircraft_count) AS aircraft
+            FROM {scan('traffic_hourly')}
+            GROUP BY 1
+        )
+        SELECT hour(kst_hour_start) AS hour_kst,
+               count(*) AS days,
+               round(avg(aircraft), 1) AS avg_aircraft
+        FROM per_hour
+        GROUP BY 1
+        ORDER BY avg_aircraft DESC
         LIMIT 10
     """,
     "하루 비행 거리 상위 기체 (상위 10)": f"""
