@@ -41,7 +41,8 @@ kafka_data/
 .claudeignore
 CLAUDE.md
 
-# 10. ML 리포트 산출물 (ml_train_trajectory.py가 MinIO 지표로 다시 만든다)
+# 10. ML 리포트 산출물 (src/ml_jobs.py가 MLflow 기록으로 다시 만든다)
 flight-ui/public/ml-report/ml_runs.json
 flight-ui/public/ml-report/ml_compare.json
+flight-ui/public/ml-report/ml_monitoring.json
 flight-ui/public/ml-report/*.tmp

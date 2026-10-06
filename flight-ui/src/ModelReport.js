@@ -1,13 +1,13 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-// Model Report — src/ml_train_trajectory.py가 내보낸 정적 파일(ml_runs.json)만 읽는다.
+// Model Report — src/ml_jobs.py(ML 전용 컨테이너)가 MLflow 기록에서 내보낸 정적 파일(ml_runs.json·ml_compare.json)만 읽는다.
 // 백엔드를 거치지 않는다(사용자 결정 2026-10-04, 정적 파일 방식). 실행 기록의 원본은 MinIO의
 // ml/trajectory_next_position/<run_id>/metrics.json이고, 이 파일은 학습 때 다시 만들어지는 사본이다.
 const REPORT_URL = '/ml-report/ml_runs.json';
-// 같은 조건 비교(기준선·HGB·Chronos-Bolt tiny) — src/ml_compare_models.py가 ML 전용 컨테이너에서 내보낸다
+// 같은 조건 비교(기준선·HGB·Chronos-Bolt tiny) — ml_jobs.py의 compare_10s 작업
 const COMPARE_URL = '/ml-report/ml_compare.json';
 
-// 특성 이름 → 화면 설명. 이름은 ml_train_trajectory.py의 FEATURES와 같아야 한다.
+// 특성 이름 → 화면 설명. 이름은 ml_jobs.py의 FEATURES와 같아야 한다.
 const FEATURE_LABELS = {
   latitude: 'Latitude',
   longitude: 'Longitude',
@@ -27,7 +27,7 @@ const FEATURE_LABELS = {
   dr_east_m: 'Dead-reckoning move, east',
 };
 
-// 2026-10-04 이전 실행의 metrics.json에는 모델 사양이 없다. 그때 코드(ml_train_trajectory.py)의
+// 모델 사양이 없는 실행(2026-10-04 이전, 지금은 MLflow로 옮기지 않아 화면에 안 나옴)에 대비한 값. 당시 코드의
 // 설정을 그대로 옮긴 값으로 보여 주고, 사양이 기록된 실행은 그 기록을 쓴다.
 const MODEL_SPEC_FALLBACK = {
   library: 'scikit-learn 1.3.2',
@@ -345,6 +345,67 @@ function Legend({ series = SERIES }) {
   );
 }
 
+// MLflow 모델 레지스트리 — 실행마다 등록된 버전, 자동 승격 관문 결과, 현재 champion.
+// 기록의 원본은 MLflow(mlflow.db + MinIO)이고, 학습 작업이 내보낸 JSON의 `mlflow` 블록을 읽는다.
+function RegistryPanel({ report }) {
+  const runs = (report?.runs || []).filter((r) => r.mlflow?.version);
+  if (!report || report.source !== 'mlflow' || runs.length === 0) return null;
+  const champ = report.champion_version;
+  return (
+    <div className="mr-registry">
+      <h3 className="mr-sub-h">Model registry · MLflow</h3>
+      <p className="mr-ko">
+        학습할 때마다 MLflow에 새 버전으로 등록되고, 같은 평가 표본에서 100 m 적중률이 기준선과 현재 champion을 모두 넘을 때만
+        champion으로 승격됩니다. {champ ? `현재 champion은 v${champ}입니다.` : '아직 승격된 버전이 없습니다 — 기준선을 넘지 못했습니다.'}
+      </p>
+      <div className="mr-registry-head">
+        <span className="mono">{report.registered_model}</span>
+        <span className={`mr-badge ${champ ? 'champ' : ''}`}>{champ ? `champion → v${champ}` : 'no champion'}</span>
+      </div>
+      <div className="mr-table-wrap">
+        <table className="mr-table">
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>Run (KST)</th>
+              <th className="num">Candidate ≤100 m</th>
+              <th className="num">Baseline</th>
+              <th className="num">Champion (re-scored)</th>
+              <th>Gate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...runs].reverse().map((r) => {
+              const m = r.mlflow;
+              const g = m.gate || {};
+              const pct = (v) => (typeof v === 'number' ? `${v.toFixed(1)}%` : '—');
+              return (
+                <tr key={m.run_id}>
+                  <td className="mono">
+                    v{m.version}
+                    {m.aliases?.includes('champion') && <span className="mr-badge champ mr-badge-sm">champion</span>}
+                  </td>
+                  <td title={m.run_id}>{fmtRunTime(r.run_id)}</td>
+                  <td className="num mono">{pct(g.candidate)}</td>
+                  <td className="num mono">{pct(g.baseline)}</td>
+                  <td className="num mono">{g.champion_version ? `${pct(g.champion)} (v${g.champion_version})` : '—'}</td>
+                  <td title={m.promotion_reason || ''}>
+                    {m.promotion === 'promoted' ? '▲ promoted' : m.promotion === 'rejected' ? '✕ rejected' : '—'}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="mr-meta">
+        Hover a gate result for the reason. Full records (params, metrics, model files) in the MLflow web UI — start it only when needed:{' '}
+        <span className="mono">docker compose --profile mlflow-ui up -d mlflow-ui</span> → <span className="mono">127.0.0.1:5000</span> (read-only).
+      </div>
+    </div>
+  );
+}
+
 function Comparison({ report }) {
   const runs = report.runs;
   const run = runs[runs.length - 1];
@@ -474,10 +535,286 @@ function Comparison({ report }) {
           <div className="mr-kpi-note">{fr.step_s} s grid, min {fr.context_min_steps} steps; gaps &gt; {fr.max_raw_gap_s} s split the series</div>
         </div>
       </div>
+      <RegistryPanel report={report} />
+
       <div className="mr-meta">
         Run {fmtRunTime(run.run_id)} · <span className="mono">{run.run_id}</span> · {runs.length} comparison run{runs.length === 1 ? '' : 's'} ·
-        source <span className="mono">{report.model_prefix}/&lt;run_id&gt;/metrics.json</span>
+        source <span className="mono">{report.model_prefix}</span>
       </div>
+    </section>
+  );
+}
+
+// 재학습 — 버튼 → backend POST /ml/train → ml-worker(내부망)가 ml_jobs.py all 실행 (0-8 2단계)
+// 진행 상태는 2초마다 GET /ml/jobs/{id}로 읽는다. 끝나면 onFinished로 리포트를 다시 불러온다.
+const API = 'http://localhost:8000';
+const JOB_LABEL = {
+  queued: 'Queued',
+  running: 'Training…',
+  succeeded: 'Finished',
+  failed: 'Failed',
+};
+
+function RetrainPanel({ onFinished }) {
+  const [job, setJob] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const timer = useRef(null);
+  const finishedRef = useRef(onFinished);
+  finishedRef.current = onFinished;
+
+  const poll = useCallback((id) => {
+    clearTimeout(timer.current);
+    fetch(`${API}/ml/jobs/${id}`, { cache: 'no-store' })
+      .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
+      .then(({ ok, j }) => {
+        if (!ok) throw new Error(j.error || 'status unavailable');
+        setJob(j);
+        if (j.state === 'queued' || j.state === 'running') {
+          timer.current = setTimeout(() => poll(id), 2000);
+        } else if (j.state === 'succeeded') {
+          finishedRef.current?.();
+        }
+      })
+      .catch((e) => setNotice(`Lost track of the job: ${e.message}`));
+  }, []);
+
+  // 페이지를 열었을 때 이미 돌고 있는 작업이 있으면 이어서 보여 준다
+  useEffect(() => {
+    fetch(`${API}/ml/jobs/latest`, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (!j) return;
+        setJob(j);
+        if (j.state === 'queued' || j.state === 'running') poll(j.id);
+      })
+      .catch(() => {});
+    return () => clearTimeout(timer.current);
+  }, [poll]);
+
+  const start = () => {
+    setBusy(true);
+    setNotice(null);
+    fetch(`${API}/ml/train`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: 'all' }),
+    })
+      .then((r) => r.json().then((j) => ({ status: r.status, j })))
+      .then(({ status, j }) => {
+        if (status === 202) {
+          setJob(j);
+          poll(j.id);
+        } else if (status === 409 && j.job) {
+          setJob(j.job);
+          poll(j.job.id);
+          setNotice('A training job is already running — showing it.');
+        } else if (status === 429) {
+          setNotice(`Cooling down after the last job — try again in ${j.retry_after_s} s.`);
+        } else if (status === 409) {
+          setNotice(`Not started: ${j.error}.`);
+        } else if (status === 503) {
+          setNotice('ml-worker is not reachable. Start the stack with docker compose up -d.');
+        } else {
+          setNotice(`Not started: ${j.error || j.detail || `HTTP ${status}`}.`);
+        }
+      })
+      .catch(() => setNotice('Backend is not reachable (localhost:8000).'))
+      .finally(() => setBusy(false));
+  };
+
+  const running = job && (job.state === 'queued' || job.state === 'running');
+  const shownLog = (job?.log_tail || []).filter((l) => /^(ML_|Traceback|\w*Error)/.test(l)).slice(-8);
+
+  return (
+    <section className="mr-card mr-retrain">
+      <div className="mr-card-head">
+        <h2>Retrain</h2>
+        <button className="mr-retrain-btn" onClick={start} disabled={busy || running}>
+          <span className={running ? 'mr-spin' : ''} aria-hidden="true">⟳</span>
+          {running ? 'Training…' : 'Retrain models'}
+        </button>
+      </div>
+      <p className="mr-card-sub">
+        Runs both jobs (next-report HGB and the 10 s three-way comparison) on all lake data, records them in MLflow,
+        registers the HGB models and applies the promotion gate. One job at a time, with a 2-minute cooldown; refused
+        while the lakehouse DAG is writing.
+      </p>
+      <p className="mr-ko">
+        버튼을 누르면 두 학습 작업을 실행해 MLflow에 기록하고, 승격 관문을 통과한 모델만 champion이 됩니다.
+        한 번에 하나씩, 끝난 뒤 2분 대기이며 레이크 DAG가 돌고 있으면 시작하지 않습니다. 보통 1분 안에 끝납니다.
+      </p>
+      {notice && <div className="mr-retrain-notice">{notice}</div>}
+      {job && (
+        <div className={`mr-job ${job.state}`}>
+          <div className="mr-job-row">
+            <span className={`mr-badge ${job.state === 'succeeded' ? 'champ' : ''}`}>{JOB_LABEL[job.state] || job.state}</span>
+            <span className="mono">job {job.id}</span>
+            <span>
+              {job.state === 'running' && job.elapsed_s != null && `${job.elapsed_s.toFixed(0)} s`}
+              {job.duration_s != null && `${job.duration_s.toFixed(1)} s`}
+            </span>
+            {job.created_at && <span>started {fmtRunTime(job.created_at.replace(/[-:]/g, ''))}</span>}
+          </div>
+          {job.error && <div className="mr-job-error">Error: {job.error}</div>}
+          {(job.gates || []).length > 0 && (
+            <ul className="mr-job-gates">
+              {job.gates.map((g) => (
+                <li key={g}>{g.replace(/^ML_GATE\[(\w+)\]\s*/, '$1 — ')}</li>
+              ))}
+            </ul>
+          )}
+          {shownLog.length > 0 && <pre className="mr-job-log">{shownLog.join('\n')}</pre>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// 실시간 모니터링 — src/ml_serving.py(profile "serving", 평소 꺼짐)가 쓰는 ml_monitoring.json을 읽는다.
+// 서빙이 돌고 있으면 15초마다 다시 읽는다. 파일이 없으면 구역을 그리지 않고 켜는 방법만 보여 준다.
+const MONITOR_URL = '/ml-report/ml_monitoring.json';
+
+function psiLabel(v) {
+  if (typeof v !== 'number') return '—';
+  if (v > 0.25) return `${v.toFixed(3)} ⚠ shift`;
+  if (v > 0.1) return `${v.toFixed(3)} · watch`;
+  return `${v.toFixed(3)} ✓`;
+}
+
+function Monitoring() {
+  const [mon, setMon] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    let timer;
+    const load = () =>
+      fetch(MONITOR_URL, { cache: 'no-store' })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => {
+          if (cancelled) return;
+          setMon(j && j.status ? j : null);
+          if (j && j.status === 'running') timer = setTimeout(load, 15000);
+        })
+        .catch(() => !cancelled && setMon(null));
+    load();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, []);
+
+  const pct = (v) => (typeof v === 'number' ? `${v.toFixed(1)}%` : '—');
+  const windows = mon?.windows || [];
+  const scoredWins = windows.filter((w) => w.model);
+  // 전체 누적 적중률(창별 채점 수로 가중 평균)
+  const pooled = (side, k) => {
+    const n = scoredWins.reduce((a, w) => a + w.scored, 0);
+    if (!n) return null;
+    return scoredWins.reduce((a, w) => a + w[side].hit_rate_pct[k] * w.scored, 0) / n;
+  };
+  const statusText = {
+    running: 'Serving',
+    stopped: 'Stopped',
+    waiting_for_champion: 'Waiting for a champion',
+  };
+
+  return (
+    <section className="mr-card">
+      <div className="mr-card-head">
+        <h2>Live monitoring · champion on real traffic</h2>
+        {mon && (
+          <span className={`mr-badge ${mon.status === 'running' ? 'champ' : ''}`}>
+            {statusText[mon.status] || mon.status}
+            {mon.model?.version ? ` · ${mon.model.name} v${mon.model.version}` : ''}
+          </span>
+        )}
+      </div>
+      <p className="mr-card-sub">
+        When serving is switched on, the 10 s champion predicts every live aircraft's position 10 seconds ahead; the
+        real report arriving 10 seconds later scores it, next to dead reckoning on the same moments. Input drift is
+        tracked with PSI against the training data. Built and verified, not operated — off by default.
+      </p>
+      <p className="mr-ko">
+        서빙을 켜면 champion 모델이 실시간 항공기의 10초 뒤 위치를 예측하고, 10초 뒤 들어오는 실제 보고로 바로 채점합니다.
+        같은 순간의 직진 가정과 나란히 비교하고, 입력 분포가 학습 데이터와 달라졌는지(PSI)도 봅니다. 평소에는 꺼 둡니다.
+      </p>
+      {!mon && (
+        <div className="mr-meta">
+          No monitoring data yet. Start serving only when needed:{' '}
+          <span className="mono">docker compose --profile serving up -d ml-serving</span> · stop with{' '}
+          <span className="mono">docker compose --profile serving stop ml-serving</span>
+        </div>
+      )}
+      {mon && (
+        <>
+          <div className="mr-kpis">
+            <div className="mr-kpi">
+              <div className="mr-kpi-value mono">{pct(pooled('model', '100'))}</div>
+              <div className="mr-kpi-label"><span className="mr-key model" /> Model · within 100 m</div>
+              <div className="mr-kpi-note">all scored windows, weighted by count</div>
+            </div>
+            <div className="mr-kpi">
+              <div className="mr-kpi-value mono">{pct(pooled('baseline', '100'))}</div>
+              <div className="mr-kpi-label"><span className="mr-key baseline" /> Baseline · within 100 m</div>
+              <div className="mr-kpi-note">same moments, dead reckoning</div>
+            </div>
+            <div className="mr-kpi">
+              <div className="mr-kpi-value mono">{fmtInt(mon.totals?.scored)}</div>
+              <div className="mr-kpi-label">Predictions scored</div>
+              <div className="mr-kpi-note">
+                of {fmtInt(mon.totals?.predictions)} made · {fmtInt(mon.totals?.unscorable)} unscorable (no report within 2 min)
+              </div>
+            </div>
+            <div className="mr-kpi">
+              <div className="mr-kpi-value mono">{mon.last_cycle?.latency_ms != null ? `${mon.last_cycle.latency_ms}` : '—'}<span>ms</span></div>
+              <div className="mr-kpi-label">Last cycle</div>
+              <div className="mr-kpi-note">
+                {mon.last_cycle?.aircraft ?? '—'} aircraft · {mon.last_cycle?.predicted ?? '—'} predicted · every {mon.cycle_s} s
+              </div>
+            </div>
+          </div>
+          {windows.length > 0 && (
+            <div className="mr-table-wrap">
+              <table className="mr-table">
+                <thead>
+                  <tr>
+                    <th>Window end (KST)</th>
+                    <th>Model</th>
+                    <th className="num">Scored</th>
+                    <th className="num">Model ≤100 m</th>
+                    <th className="num">Baseline ≤100 m</th>
+                    <th className="num">Model p50</th>
+                    <th className="num">Baseline p50</th>
+                    <th className="num">PSI speed</th>
+                    <th className="num">PSI altitude</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...windows].reverse().slice(0, 12).map((w) => (
+                    <tr key={w.idx}>
+                      <td>{fmtRunTime(w.end.replace(/[-:]/g, ''))}</td>
+                      <td className="mono">v{w.model_version}</td>
+                      <td className="num mono">{fmtInt(w.scored)}</td>
+                      <td className="num mono">{pct(w.model?.hit_rate_pct?.['100'])}</td>
+                      <td className="num mono">{pct(w.baseline?.hit_rate_pct?.['100'])}</td>
+                      <td className="num mono">{fmtM(w.model?.p50_m)}</td>
+                      <td className="num mono">{fmtM(w.baseline?.p50_m)}</td>
+                      <td className="num mono">{psiLabel(w.psi?.velocity)}</td>
+                      <td className="num mono">{psiLabel(w.psi?.baro_altitude)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="mr-meta">
+            Window {Math.round((mon.window_s || 0) / 60)} min · PSI: under 0.1 stable, 0.1–0.25 watch, over 0.25 shifted ·
+            reference = training data ({mon.reference ? `${fmtInt(mon.reference.rows)} rows, ${mon.reference.dates.length} days` : 'unavailable'}) ·
+            MLflow experiment <span className="mono">{mon.experiment}</span> · updated {mon.generated_at ? fmtRunTime(mon.generated_at.replace(/[-:]/g, '')) : '—'}
+            {(mon.notes || []).length > 0 && ` · ${mon.notes.join('; ')}`}
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -485,6 +822,7 @@ function Comparison({ report }) {
 export default function ModelReport() {
   const [state, setState] = useState({ status: 'loading', report: null });
   const [compare, setCompare] = useState(null);
+  const [reloadKey, setReloadKey] = useState(0); // 재학습이 끝나면 올려서 두 리포트를 다시 읽는다
 
   useEffect(() => {
     let cancelled = false;
@@ -497,7 +835,7 @@ export default function ModelReport() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -522,7 +860,7 @@ export default function ModelReport() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   const runs = useMemo(() => state.report?.runs ?? [], [state.report]);
   const latest = runs[runs.length - 1];
@@ -544,6 +882,8 @@ export default function ModelReport() {
         </p>
       </div>
 
+      <RetrainPanel onFinished={() => setReloadKey((k) => k + 1)} />
+
       {state.status === 'loading' && (
         <div className="mr-card mr-empty">
           <div className="overlay-spinner" />
@@ -556,7 +896,7 @@ export default function ModelReport() {
           <div className="overlay-title">No report yet</div>
           <div className="overlay-desc">
             Train once (or re-export the existing runs) with the stack running:
-            <pre className="mr-cmd">docker compose exec airflow python src/ml_train_trajectory.py{'\n'}docker compose exec airflow python src/ml_train_trajectory.py --export-only</pre>
+            <pre className="mr-cmd">docker compose run --rm ml{'\n'}docker compose run --rm ml python src/ml_jobs.py export</pre>
           </div>
         </div>
       )}
@@ -596,6 +936,9 @@ export default function ModelReport() {
 
           {/* 같은 조건 3개 모델 비교 (있을 때만) */}
           {compare && <Comparison report={compare} />}
+
+          {/* 실시간 모니터링 (서빙을 켰을 때만 값이 생긴다) */}
+          <Monitoring />
 
           {/* ② 오차 비교 */}
           <section className="mr-card">
@@ -719,9 +1062,10 @@ export default function ModelReport() {
                 </tbody>
               </table>
             </div>
+            <RegistryPanel report={state.report} />
             <div className="mr-meta">
               Report generated {state.report.generated_at ? fmtRunTime(state.report.generated_at.replace(/[-:]/g, '').replace(/\.\d+/, '')) : '—'} ·
-              source <span className="mono">{state.report.model_prefix}/&lt;run_id&gt;/metrics.json</span>
+              source <span className="mono">{state.report.model_prefix}</span>
             </div>
           </section>
         </>

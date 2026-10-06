@@ -1842,3 +1842,130 @@ body, html, #root {
   margin-top: 10px;
 }
 
+/* MLflow 모델 레지스트리 */
+.mr-registry {
+  margin-top: 22px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.mr-registry-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 10px;
+  font-size: 0.85rem;
+}
+
+.mr-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-dim);
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.mr-badge.champ {
+  color: var(--primary);
+  border-color: var(--primary);
+}
+
+.mr-badge-sm {
+  margin-left: 6px;
+  padding: 1px 7px;
+  font-size: 0.66rem;
+}
+
+/* 재학습 패널 (0-8 2단계) */
+.mr-retrain-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: #fff;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.mr-retrain-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.mr-retrain-btn:focus-visible {
+  outline: 2px solid var(--primary-2);
+  outline-offset: 2px;
+}
+
+.mr-spin {
+  display: inline-block;
+  animation: mr-spin 1s linear infinite;
+}
+
+@keyframes mr-spin {
+  to { transform: rotate(360deg); }
+}
+
+.mr-retrain-notice {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.mr-job {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: var(--bg-soft);
+}
+
+.mr-job.failed {
+  border-color: var(--danger);
+}
+
+.mr-job-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.mr-job-error {
+  margin-top: 8px;
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+.mr-job-gates {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  font-size: 0.8rem;
+}
+
+.mr-job-log {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow: auto;
+}
+

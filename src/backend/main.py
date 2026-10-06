@@ -5,8 +5,10 @@ import select
 import threading
 
 import psycopg2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import requests
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
@@ -30,7 +32,9 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "flightdb")
 
-DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# 드라이버를 명시한다(psycopg2). requirements.txt가 버전을 고정하지 않아 2026-10-06 재빌드 때
+# SQLAlchemy 2.1이 깔렸고, 2.1은 "postgresql://"의 기본 드라이버를 psycopg(v3)로 바꿔 시작이 실패했다.
+DB_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 engine = create_engine(DB_URL)
 
 # 2026-09-17: flight_data(append-only, DISTINCT ON으로 매번 재계산) 대신
@@ -115,6 +119,52 @@ def get_flight_trail(icao24: str, minutes: int = 30):
 
 
 # ---------------------------------------------------------------
+# 0-8 2단계 (2026-10-06): Model Report의 Retrain 버튼 → 여기 → ml-worker(내부망)
+# ---------------------------------------------------------------
+# backend는 요청을 넘기기만 한다. 학습·순서·대기·DAG 확인은 ml-worker가 판단한다(src/ml_worker.py).
+#
+# 【출처 검사】 위 CORS는 모든 출처를 허용한다(allow_origins=["*"]). 그대로면 사용자가 브라우저로 연
+# 아무 웹사이트나 이 주소로 학습을 시작시킬 수 있다. 그래서 **학습 시작(POST)에만** 대시보드 출처를
+# 검사한다. 브라우저는 다른 출처로 POST할 때 Origin 헤더를 항상 붙이므로, 이 검사로 남의 사이트가
+# 보낸 요청은 막힌다. Origin이 없는 요청(같은 컴퓨터의 터미널 도구 등)은 통과한다 — 같은 네트워크의
+# 다른 기기가 직접 호출하는 경우는 ml-worker의 "1개씩·120초 대기"로 완화한다(포트 설정은 바꾸지 않기로 함).
+ML_WORKER_URL = os.getenv("ML_WORKER_URL", "http://ml-worker:8001")
+ML_UI_ORIGINS = {"http://localhost:3000", "http://127.0.0.1:3000"}
+
+
+def _ml_worker(method, path, payload=None):
+    try:
+        r = requests.request(method, f"{ML_WORKER_URL}{path}", json=payload, timeout=10)
+        return JSONResponse(r.json(), status_code=r.status_code)
+    except (requests.RequestException, ValueError):
+        return JSONResponse({"error": "ml-worker unreachable"}, status_code=503)
+
+
+@app.post("/ml/train")
+async def ml_train(request: Request):
+    origin = request.headers.get("origin")
+    if origin is not None and origin not in ML_UI_ORIGINS:
+        raise HTTPException(status_code=403, detail="origin not allowed")
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    target = body.get("target", "all") if isinstance(body, dict) else "all"
+    return await asyncio.to_thread(_ml_worker, "POST", "/jobs", {"target": target})
+
+
+@app.get("/ml/jobs/latest")
+def ml_job_latest():
+    return _ml_worker("GET", "/jobs/latest")
+
+
+@app.get("/ml/jobs/{job_id}")
+def ml_job(job_id: str):
+    if not job_id.isalnum() or len(job_id) > 32:
+        raise HTTPException(status_code=400, detail="bad job id")
+    return _ml_worker("GET", f"/jobs/{job_id}")
+
+
 # Phase 2 (docs/EXPANSION_PLAN.md): Polling → WebSocket 실시간 푸시
 # ---------------------------------------------------------------
 # src/spark_dual_write.py가 배치를 Postgres에 성공적으로 쓴 직후
