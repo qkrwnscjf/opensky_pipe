@@ -1,7 +1,13 @@
-requests
-kafka-python
-python-dotenv
-fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg2-binary
+# producer·backend 공용 (Dockerfile.app). 버전을 정확히 고정한다 — 2026-10-06 사용자 결정.
+# 고정 전에는 빌드할 때마다 최신이 깔려, SQLAlchemy 2.1이 들어온 날 backend가 시작하지 못했다
+# (2.1이 postgresql:// 기본 드라이버를 psycopg v3로 바꿈 → 연결 주소에 +psycopg2를 명시해 해결).
+# 값은 그날 재빌드해 정상 동작을 확인한 backend 이미지에 실제로 설치된 버전이다.
+# 직접 쓰는 패키지만 고정하고, 그 아래 의존성(예: uvicorn[standard]의 websockets)은 따라오게 둔다.
+# 올릴 때는 한 번에 하나씩 올리고, 재빌드 후 /flights·WebSocket·producer 전송을 확인한다.
+requests==2.34.2
+kafka-python==3.0.11
+python-dotenv==1.2.4
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+sqlalchemy==2.1.3
+psycopg2-binary==2.9.13
