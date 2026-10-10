@@ -1984,3 +1984,19 @@ body, html, #root {
   accent-color: var(--primary);
 }
 
+/* C안: 갱신 주기 진행 막대 — 마지막 갱신부터 예상 간격까지 차오른다 */
+.hud-cycle {
+  margin-top: 6px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.hud-cycle span {
+  display: block;
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.9s linear;
+}
+

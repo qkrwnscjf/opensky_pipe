@@ -3,6 +3,9 @@ import json
 import os
 import select
 import threading
+import time
+from collections import deque
+from datetime import datetime
 
 import psycopg2
 import requests
@@ -220,13 +223,48 @@ def ml_job(job_id: str):
 _ws_clients: set[WebSocket] = set()
 
 
+# C안 (2026-10-10, 사용자 결정): 갱신 리듬을 화면에 보여 주기 위한 메타데이터.
+#
+# Spark·DB는 들어오는 즉시 쓴다(지연을 늘리지 않음). 대신 WebSocket 메시지에
+#   updated_at          — 새 스냅샷(데이터 시각이 바뀐 것)을 처음 보낸 서버 시각
+#   data_time           — 그 스냅샷의 OpenSky 시각(데이터 자체의 나이를 보여 주는 기준)
+#   expected_interval_s — 최근 실제 갱신 간격의 중앙값(새 스냅샷끼리의 간격). 3번 쌓이기 전에는 10초
+# 를 실어, 화면이 "마지막 갱신 n초 전 / 다음 갱신 약 n초 후"를 그리게 한다.
+# 갱신은 "데이터 시각이 바뀐 때"로만 센다 — 한 스냅샷이 Spark 트리거 두 번에 걸쳐 나뉘어 NOTIFY가
+# 두 번 와도 리듬이 흔들리지 않게. OpenSky 스냅샷이 약 8~10초마다라 기준값은 10초(사용자 결정).
+NOMINAL_INTERVAL_S = 10.0
+_cadence = {"data_time": None, "changed_at": None, "intervals": deque(maxlen=12)}
+
+
+def _flights_envelope(flights):
+    data_time = max((f["timestamp"] for f in flights if f["timestamp"]), default=None)
+    now = time.time()
+    if data_time is not None and data_time != _cadence["data_time"]:
+        if _cadence["changed_at"] is not None:
+            _cadence["intervals"].append(now - _cadence["changed_at"])
+        _cadence["data_time"] = data_time
+        _cadence["changed_at"] = now
+    iv = sorted(_cadence["intervals"])
+    expected = round(iv[len(iv) // 2], 1) if len(iv) >= 3 else NOMINAL_INTERVAL_S
+    changed = _cadence["changed_at"]
+    return {
+        "type": "flights",
+        "sent_at": iso_utc(datetime.utcnow()),
+        "updated_at": iso_utc(datetime.utcfromtimestamp(changed)) if changed else None,
+        "data_time": data_time,
+        "expected_interval_s": expected,
+        "nominal_interval_s": NOMINAL_INTERVAL_S,
+        "flights": flights,
+    }
+
+
 async def _broadcast_flights():
     # A-4 (docs/EXPANSION_PLAN.md): 직렬화는 한 번만 한다.
     #
     # send_json(payload)은 호출될 때마다 payload를 JSON으로 직렬화한다. 모든
     # 클라이언트에게 '같은' 데이터를 보내는데도 클라이언트 수만큼 같은 일을
     # 반복하던 구조였다. 한 번 dumps한 문자열을 send_text로 돌려쓴다.
-    payload = json.dumps(jsonable_encoder(fetch_flights()))
+    payload = json.dumps(jsonable_encoder(_flights_envelope(fetch_flights())))
 
     # 순차 await도 함께 고쳤다. 느린 클라이언트 하나가 뒤의 모두를 막고 있었다.
     # gather로 동시에 보내고, 예외는 개별로 회수해 죽은 연결만 정리한다.
@@ -276,7 +314,7 @@ async def websocket_flights(websocket: WebSocket):
     await websocket.accept()
     _ws_clients.add(websocket)
     try:
-        await websocket.send_json(jsonable_encoder(fetch_flights()))
+        await websocket.send_json(jsonable_encoder(_flights_envelope(fetch_flights())))
         while True:
             # 클라이언트가 메시지를 보내진 않지만, 연결 종료(WebSocketDisconnect)를
             # 감지하려면 뭔가를 await 하고 있어야 함.

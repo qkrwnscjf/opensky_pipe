@@ -192,6 +192,9 @@ function App() {
   const [clock, setClock] = useState(new Date());
   const [theme, setTheme] = useState(readInitialTheme);
   const [lastUpdate, setLastUpdate] = useState(null);
+  // C안 (2026-10-10): 서버가 보내는 갱신 리듬 — 새 스냅샷을 보낸 시각, 데이터(OpenSky) 시각, 예상 간격(초)
+  const [cadence, setCadence] = useState(null);
+  const lastUpdatedRef = useRef(null); // 같은 스냅샷이 다시 와도 펄스를 다시 켜지 않으려고
   const [pulse, setPulse] = useState(0);
   const [followMode, setFollowMode] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -237,11 +240,27 @@ function App() {
       ws.onopen = () => setConnected(true);
       ws.onmessage = (event) => {
         try {
+          const msg = JSON.parse(event.data);
+          // C안: 이제 메시지는 {flights, updated_at, data_time, expected_interval_s} 봉투다.
+          // 예전 형식(배열)도 받는다 — backend와 화면 배포 순서가 어긋나도 깨지지 않게.
+          const list = Array.isArray(msg) ? msg : msg.flights || [];
           // 국가는 편명(항공사 코드) 기준으로 판정해 붙인다 — airlines.js 참고
-          setFlights(JSON.parse(event.data).map((f) => ({ ...f, ...resolveCountry(f) })));
-          setLastUpdate(new Date());
+          setFlights(list.map((f) => ({ ...f, ...resolveCountry(f) })));
           setHasLoadedOnce(true);
-          setPulse((p) => p + 1); // 상단 펄스 바 애니메이션 재시작용
+          if (Array.isArray(msg)) {
+            setLastUpdate(new Date());
+            setPulse((p) => p + 1);
+          } else {
+            const updatedAt = parseUtc(msg.updated_at);
+            // 같은 스냅샷이 두 번 와도(Spark 트리거 두 번에 걸친 경우) 갱신으로 세지 않는다
+            const key = updatedAt ? updatedAt.getTime() : null;
+            if (key !== lastUpdatedRef.current) {
+              lastUpdatedRef.current = key;
+              setPulse((p) => p + 1); // 상단 펄스 바 애니메이션 재시작용
+            }
+            setCadence({ updatedAt, dataTime: parseUtc(msg.data_time), expected: msg.expected_interval_s || 10 });
+            setLastUpdate(updatedAt || new Date());
+          }
         } catch (e) {
           console.error('FLIGHT_DATA_PARSE_FAILED:', e);
         }
@@ -422,6 +441,10 @@ function App() {
 
   // clock이 1초마다 갱신되므로 이 값도 자연스럽게 카운트업된다.
   const secondsAgo = lastUpdate ? Math.max(0, Math.round((clock - lastUpdate) / 1000)) : null;
+  // C안: 다음 갱신까지 남은 시간(예상) — 최근 실제 간격의 중앙값 기준이라 ±2초 정도 오차가 있다
+  const nextIn = cadence && secondsAgo !== null ? Math.round(cadence.expected - secondsAgo) : null;
+  const nextText = nextIn === null ? '—' : nextIn > 0 ? `≈${nextIn}s` : 'due';
+  const dataAge = cadence?.dataTime ? Math.max(0, Math.round((clock - cadence.dataTime) / 1000)) : null;
 
   const [heroRef, heroVisible] = useReveal();
   const [showcaseRef, showcaseVisible] = useReveal();
@@ -455,9 +478,10 @@ function App() {
           </div>
           <span
             className="nav-updated mono"
-            title="Time since the last WebSocket push"
+            title={cadence ? `Updates about every ${cadence.expected}s (median of recent snapshots). Next update is an estimate.` : 'Time since the last WebSocket push'}
           >
             {secondsAgo === null ? '—' : `${secondsAgo}s ago`}
+            {cadence && ` · next ${nextText}`}
           </span>
           <span className="nav-clock mono">{formatKst(clock)}</span>
           <button
@@ -714,6 +738,21 @@ function App() {
               <span>Updated</span>
               <b>{secondsAgo === null ? '—' : `${secondsAgo}s ago`}</b>
             </div>
+            {cadence && (
+              <>
+                <div className="hud-row" title={`Recent update interval ≈ ${cadence.expected}s`}>
+                  <span>Next update</span>
+                  <b>{nextText}</b>
+                </div>
+                <div className="hud-row" title="Age of the OpenSky snapshot itself (OpenSky's own delay included)">
+                  <span>Data age</span>
+                  <b>{dataAge === null ? '—' : `${dataAge}s`}</b>
+                </div>
+                <div className="hud-cycle" aria-hidden="true">
+                  <span style={{ width: `${Math.min(100, Math.max(0, (secondsAgo / cadence.expected) * 100))}%` }} />
+                </div>
+              </>
+            )}
           </div>
 
           <div className="map-legend">
