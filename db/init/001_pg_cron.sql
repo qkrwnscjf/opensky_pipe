@@ -17,7 +17,11 @@
 -- 다시 붙으며 바로 뒤에 `LOG: pg_cron scheduler started`가 찍힌다 (2026-09-18 확인).
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- ① flight_data(이력) 정리 — 10분마다 70분 지난 행을 지운다. (1-A D-1, 2026-10-10)
+-- ① flight_data(이력) 정리 — 10분마다 35분 지난 행을 지운다. (1-A D-1 → H 결정으로 35분, 2026-10-10)
+--
+-- H 결정(사용자): Hot DB에는 서빙에 필요한 만큼만. 궤적 조회를 30분으로 맞추고(backend가 최대 30분으로
+-- 제한), ml-serving의 조회 범위(15분)도 그 안에 들어가므로 보존을 70분 → 35분으로 줄였다(30분 + 여유 5분).
+-- 아래 설명의 70분은 그 전 단계(1-A D-1)의 근거다.
 --
 -- 이전에는 매시 정각에 1시간 지난 행을 지웠다. 그러면 정각 직전에는 거의 2시간치가 남아
 -- 보존량이 1~2시간 사이를 오갔다. 이 테이블을 읽는 궤적 조회(/flights/{icao24}/trail)는 최대
@@ -40,7 +44,7 @@ SELECT cron.schedule(
     DO $guard$
     BEGIN
         IF to_regclass('public.flight_data') IS NOT NULL THEN
-            DELETE FROM flight_data WHERE timestamp < NOW() - INTERVAL '70 minutes';
+            DELETE FROM flight_data WHERE timestamp < NOW() - INTERVAL '35 minutes';
         END IF;
     END
     $guard$;

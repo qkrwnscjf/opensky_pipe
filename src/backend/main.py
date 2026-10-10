@@ -150,7 +150,8 @@ TRAIL_QUERY = text("""
 @app.get("/flights/{icao24}/trail")
 def get_flight_trail(icao24: str, minutes: int = 30):
     """선택한 항공기의 최근 이동 경로를 시간순으로 반환합니다."""
-    minutes = max(1, min(minutes, 60))
+    # H 결정(2026-10-10): flight_data 보존이 35분이라 궤적도 최대 30분으로 맞춘다(그 이상은 어차피 비어 있다).
+    minutes = max(1, min(minutes, 30))
     with engine.connect() as conn:
         result = conn.execute(TRAIL_QUERY, {"icao24": icao24, "minutes": minutes})
         return [

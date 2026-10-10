@@ -253,6 +253,14 @@ def ensure_index():
         )
         conn.autocommit = True
         with conn.cursor() as cur:
+            # H-1 (2026-10-10): 전에는 Spark JDBC writer가 첫 append 때 18개 필드 전부로 테이블을 만들었다.
+            # 이제 쓰기를 psycopg2로 직접 하므로(H-2) 테이블도 여기서 필요한 컬럼(HISTORY_COLS)만으로 만든다.
+            cur.execute(f"CREATE TABLE IF NOT EXISTS flight_data ({_cols_ddl(HISTORY_COLS)})")
+            # H-2: 같은 항공기의 같은 위치 보고(time_position)는 한 번만 저장한다 — 아래 INSERT의
+            # ON CONFLICT DO NOTHING이 이 고유 인덱스를 쓴다.
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_flight_position ON flight_data (icao24, time_position)"
+            )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_flight_latest ON flight_data (icao24, timestamp DESC)"
             )
@@ -261,7 +269,7 @@ def ensure_index():
             )
         conn.close()
         _index_ready = True
-        print("INDEX_READY: idx_flight_latest, idx_flight_timestamp ensured on flight_data")
+        print("INDEX_READY: flight_data (H-1 columns) + uq_flight_position, idx_flight_latest, idx_flight_timestamp")
     except Exception as e:
         print(f"INDEX_SETUP_WARNING: {e}")
 
@@ -296,16 +304,49 @@ _current_table_ready = False
 _PG_TYPES = {"string": "TEXT", "long": "BIGINT", "double": "DOUBLE PRECISION",
              "boolean": "BOOLEAN", "int": "INTEGER"}
 
+# ---------------------------------------------------------------
+# Hot DB 경량화 — H-1·H-2·H-3 (2026-10-10, 사용자 결정)
+# ---------------------------------------------------------------
+# Hot DB는 "지금 보여 줄 만큼만 담는 작업대"다. 모든 필드·모든 행의 영구 원본은 Cold Path(MinIO
+# Bronze)가 따로 갖고 있으므로, 여기서는 실제로 읽히는 것만 남긴다.
+#
+# H-1 컬럼 축소: 두 테이블 모두 18개 필드 전부를 담고 있었다.
+#   flight_current ← /flights(화면 지도·목록)가 읽는 13개
+#   flight_data    ← 궤적(/trail: icao24·위경도·timestamp)과 ml-serving(time_position·속도·방향·
+#                    기압 고도·상승률·지상 여부)이 읽는 10개. sensors(100% null)·spi·position_source·
+#                    last_contact·callsign·origin_country·squawk·geo_altitude는 아무도 읽지 않았다.
+# H-2 위치가 바뀐 행만: flight_data에 (icao24, time_position) 고유 인덱스를 두고 ON CONFLICT DO
+#   NOTHING으로 넣는다. 항공기가 새 위치를 보고하지 않아도 스냅샷마다 같은 위치가 다시 들어와
+#   약 25%가 반복 행이었다(Gold 설계 때 Bronze에서 25.4% 측정). 궤적에 같은 점이 여러 번 찍히던
+#   문제와, producer 재시작 직후·Kafka 재시도로 생기는 완전 중복도 함께 막힌다. 남는 것은 가장 이른
+#   스냅샷의 행 — Gold의 소유 규칙(가장 이른 스냅샷)과 같다.
+# H-3 flight_current는 위치가 그대로여도 timestamp(스냅샷 시각)는 갱신한다 — 화면의 5분 신선도
+#   필터가 "아직 레이더에 있다"를 판단하는 기준이라서. (기존 동작 유지)
+#
+# 쓰기 경로도 하나로 합쳤다: 예전에는 flight_data를 Spark JDBC append(Spark 작업 1개)로, flight_current를
+# foreachPartition + psycopg2(작업 1개)로 따로 썼다. JDBC는 ON CONFLICT를 못 써서 H-2를 하려면 어차피
+# psycopg2로 가야 하므로, 파티션마다 연결 하나·트랜잭션 하나로 두 테이블을 함께 쓴다 → 배치당 Spark
+# 작업이 하나 줄고, 두 테이블이 같은 배치 내용으로 함께 커밋된다.
+CURRENT_COLS = ["icao24", "callsign", "origin_country", "latitude", "longitude", "velocity",
+                "true_track", "geo_altitude", "baro_altitude", "on_ground", "vertical_rate",
+                "squawk", "timestamp"]
+HISTORY_COLS = ["icao24", "time_position", "timestamp", "latitude", "longitude", "velocity",
+                "true_track", "baro_altitude", "vertical_rate", "on_ground"]
+_FIELD_TYPES = {name: type_name for name, type_name, _ in FLIGHT_FIELDS}
+
+
+def _cols_ddl(cols):
+    return ", ".join(
+        f"{c} TIMESTAMP" if c == "timestamp" else f"{c} {_PG_TYPES[_FIELD_TYPES[c]]}" for c in cols
+    )
+
 
 def ensure_current_table():
     global _current_table_ready
     if _current_table_ready:
         return
     try:
-        cols_ddl = ", ".join(
-            f"{name} TIMESTAMP" if name == "timestamp" else f"{name} {_PG_TYPES[type_name]}"
-            for name, type_name, _ in FLIGHT_FIELDS
-        )
+        cols_ddl = _cols_ddl(CURRENT_COLS)  # H-1: 화면이 쓰는 컬럼만
         conn = psycopg2.connect(
             host=os.getenv("DB_HOST", "localhost"),
             port=os.getenv("DB_PORT", "5432"),
@@ -332,24 +373,27 @@ def ensure_current_table():
         print(f"CURRENT_TABLE_SETUP_WARNING: {e}")
 
 
-def upsert_flight_current(batch_df):
-    """유효 레코드를 flight_current에 UPSERT한다.
+def write_hot_tables(batch_df):
+    """유효 레코드를 Hot DB 두 테이블에 쓴다 — flight_data(위치가 바뀐 행만) + flight_current(UPSERT).
 
-    Spark의 DataFrameWriter.jdbc()는 append(순수 INSERT)만 지원하고 ON CONFLICT를
-    모른다. 그래서 flight_data처럼 표준 JDBC 쓰기 경로를 쓰지 못하고, 파티션마다
-    별도 연결을 열어 psycopg2로 직접 실행한다 — flight_data의 JDBC append가
-    파티션당 태스크 1개·연결 1개인 것과 같은 병렬 구조를 유지한다.
+    H-1·H-2 (2026-10-10): 예전에는 flight_data를 Spark JDBC append로, flight_current를 이 함수로
+    따로 썼다. JDBC는 ON CONFLICT를 모르므로 H-2(위치 반복 행 제외)를 하려면 psycopg2로 직접 써야 하고,
+    그렇다면 파티션마다 연결 하나·트랜잭션 하나로 두 테이블을 같이 쓰는 편이 Spark 작업도 하나 줄어든다.
 
     partition마다 새로 연결하는 이유: foreachPartition은 executor에서 실행돼
-    드라이버의 _notify_conn 같은 전역 연결을 재사용할 수 없다. 배치당 발생 비용은
-    flight_data JDBC append와 동급(연결 수만큼)이라 새로운 비용 항목은 아니다.
+    드라이버의 _notify_conn 같은 전역 연결을 재사용할 수 없다.
     """
-    cols = FIELD_NAMES
-    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "icao24")
+    cur_cols = CURRENT_COLS
+    hist_cols = HISTORY_COLS
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cur_cols if c != "icao24")
     sql = (
-        f"INSERT INTO flight_current ({', '.join(cols)}) VALUES %s "
+        f"INSERT INTO flight_current ({', '.join(cur_cols)}) VALUES %s "
         f"ON CONFLICT (icao24) DO UPDATE SET {set_clause} "
         f"WHERE flight_current.timestamp < EXCLUDED.timestamp"
+    )
+    hist_sql = (
+        f"INSERT INTO flight_data ({', '.join(hist_cols)}) VALUES %s "
+        f"ON CONFLICT (icao24, time_position) DO NOTHING"
     )
     db_host = os.getenv("DB_HOST", "localhost")
     db_port = os.getenv("DB_PORT", "5432")
@@ -378,23 +422,35 @@ def upsert_flight_current(batch_df):
         # 배치당 한 번(약 90행)만 하면 되고, 조회할 때마다 수천 행을 훑던 것과
         # 대비된다.
         latest = {}
+        # H-2: 같은 (icao24, time_position)은 가장 이른 스냅샷 하나만. 한 INSERT 안에서 같은 키가 두 번
+        # 나오면 ON CONFLICT DO NOTHING이라도 둘 다 넣으려다 하나가 무시될 뿐이지만, 어느 쪽이 남을지
+        # 정하려고 여기서 먼저 접는다(Gold와 같은 "가장 이른 스냅샷" 규칙). time_position이 없는 행은
+        # 고유 인덱스가 걸리지 않으므로(NULL끼리는 같지 않다) 스냅샷마다 그대로 넣는다.
+        first_seen = {}
         for row in rows:
             prev = latest.get(row["icao24"])
             if prev is None or row["timestamp"] > prev["timestamp"]:
                 latest[row["icao24"]] = row
-        values = [tuple(row[c] for c in cols) for row in latest.values()]
+            key = (row["icao24"], row["time_position"] if row["time_position"] is not None else ("snap", row["timestamp"]))
+            seen = first_seen.get(key)
+            if seen is None or row["timestamp"] < seen["timestamp"]:
+                first_seen[key] = row
+        values = [tuple(row[c] for c in cur_cols) for row in latest.values()]
+        hist_values = [tuple(row[c] for c in hist_cols) for row in first_seen.values()]
         if not values:
             return
         conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name,
                                  user=db_user, password=db_password)
         try:
-            conn.autocommit = True
+            # 두 테이블을 한 트랜잭션으로 — 이력과 현재 상태가 같은 배치 내용으로 함께 커밋되거나 함께 실패한다.
             with conn.cursor() as cur:
+                execute_values(cur, hist_sql, hist_values, page_size=1000)
                 execute_values(cur, sql, values)
+            conn.commit()
         finally:
             conn.close()
 
-    batch_df.foreachPartition(_write_partition)
+    batch_df.select(*sorted(set(cur_cols) | set(hist_cols))).foreachPartition(_write_partition)
 
 
 # Phase 2 (docs/EXPANSION_PLAN.md): 배치가 Postgres에 성공적으로 쓰인 직후 호출.
@@ -518,34 +574,12 @@ def save_to_hot(batch_df, batch_id):
     if count > 0:
         print(f"[{batch_id}] {count} records processing...")
         try:
-            # PostgreSQL 저장
-            db_host = os.getenv("DB_HOST", "localhost")
-            db_port = os.getenv("DB_PORT", "5432")
-            db_name = os.getenv("DB_NAME", "flightdb")
-            db_user = os.getenv("DB_USER", "myuser")
-            db_password = os.getenv("DB_PASSWORD", "mypassword")
-            # reWriteBatchedInserts=true: PostgreSQL JDBC 드라이버가 batchsize로 묶인
-            # 개별 INSERT 문들을 하나의 multi-row INSERT로 재작성한다. 옵션이 없으면
-            # batchsize=1000을 줘도 드라이버는 문장을 하나씩 보내 왕복이 행 수만큼 생긴다.
-            jdbc_url = (f"jdbc:postgresql://{db_host}:{db_port}/{db_name}"
-                        f"?reWriteBatchedInserts=true")
-
-            _timed("postgres", lambda: batch_df.write
-                   .mode("append")
-                   .format("jdbc")
-                   .option("url", jdbc_url)
-                   .option("dbtable", "flight_data")
-                   .option("user", db_user)
-                   .option("password", db_password)
-                   .option("driver", "org.postgresql.Driver")
-                   .option("batchsize", "1000")
-                   .save())
-
+            # PostgreSQL 저장 — H-1·H-2 (2026-10-10): 두 테이블을 한 번의 Spark 작업·파티션별 한 트랜잭션으로.
+            # 예전 경로: flight_data JDBC append(18개 필드 전부, 스냅샷마다) → flight_current UPSERT(작업 1개 더).
+            # 테이블은 쓰기 전에 만든다 — 이제 JDBC writer가 자동 생성하지 않는다.
             _timed("ensure_index", ensure_index)
             _timed("ensure_current_table", ensure_current_table)
-            # flight_data와 같은 batch_df(유효 레코드만)를 그대로 재사용한다 —
-            # Kafka를 다시 읽지 않는다. persist()가 이미 캐시해 둔 덕분이다.
-            _timed("current_upsert", lambda: upsert_flight_current(batch_df))
+            _timed("hot_write", lambda: write_hot_tables(batch_df))
             _timed("notify", notify_flight_update)
 
         except Exception as e:
