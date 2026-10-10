@@ -54,11 +54,35 @@ if OPENSKY_USER and OPENSKY_PASSWORD:
 else:
     print("익명 계정으로 수집을 시작합니다. (일일 제한 주의)")
 
-# 직전에 전송한 스냅샷의 time 값. OpenSky(특히 익명 티어)는 10초 폴링 사이에 아직 갱신되지
-# 않은 "같은 스냅샷"(동일한 data['time'])을 그대로 돌려주는 경우가 있다. 이를 걸러내지 않으면
-# 좌표·속도까지 완전히 동일한 레코드가 Kafka에 두 번 실려 flight_data에 중복 행으로 쌓인다.
-# (2026-08-20 실측: 정상 동작 중에도 3분당 수십 쌍씩 누적 — docs/BENCHMARKS.md 참고)
-_last_snapshot_time = None
+# 지금까지 전송에 성공한 스냅샷 time의 최댓값(워터마크). 이보다 같거나 이른 스냅샷은 보내지 않는다.
+#
+# OpenSky(특히 익명 티어)는 10초 폴링 사이에 아직 갱신되지 않은 "같은 스냅샷"을 그대로 돌려주는
+# 경우가 있다(2026-08-20 실측: 3분당 수십 쌍 중복). 처음에는 "직전 스냅샷과 같으면 생략"만 했는데,
+# 2026-10-10 점검에서 그걸로는 부족하다는 것이 드러났다:
+#   - Bronze 7일 중 3일에서 "스냅샷 하나의 항공기 전부가 정확히 2번" 들어간 경우가 8건.
+#   - OpenSky 응답이 서버마다 엇갈려 **더 오래된 스냅샷이 나중에 도착**하는 일이 실제로 관측됨
+#     (1초 차, Kafka 6개 파티션에서 동시에 역행).
+#   - 그러면 T → X(더 오래된 것) → T 순서로 오고, 세 번째 T는 "직전(X)과 다르다"고 판단돼 다시 전송된다.
+# 워터마크 하나로 이 두 가지(같은 스냅샷 재등장, 오래된 스냅샷 늦게 도착)를 함께 막는다. 기억하는 것은
+# 정수 하나라 메모리 사용이 늘지 않는다(최근 N개를 기억하는 방식은 N이 커질수록 늘고, N을 넘는 엇갈림은
+# 놓친다). 오래된 스냅샷을 버려도 잃는 정보는 없다 — 그보다 새 위치가 이미 나갔다. 오히려 그걸 보내면
+# 한 파티션 안에서 기체별 시간이 거꾸로 가 A-2(기체별 순서 보장)를 깬다.
+# 막지 못하는 경우: producer 재시작 직후(워터마크가 비어 있음), Kafka가 응답을 잃고 요청을 재시도한 경우.
+# 둘 다 드물고, 남은 중복은 Silver 중복 제거·flight_current 기본키·궤적 조회 DISTINCT ON이 흡수한다.
+_sent_watermark = None
+_skipped_repeat_total = 0
+_skipped_older_total = 0
+
+
+def snapshot_decision(snapshot_time, watermark):
+    """'send' | 'repeat'(이미 보낸 것과 같음) | 'older'(이미 보낸 것보다 이름)."""
+    if snapshot_time is None or watermark is None:
+        return "send"
+    if snapshot_time == watermark:
+        return "repeat"
+    if snapshot_time < watermark:
+        return "older"
+    return "send"
 
 # icao24가 없는 레코드는 key_serializer가 None을 돌려주어 라운드로빈으로 '안전하게'
 # 강등된다 — 예외로 수집이 끊기지 않는다. 문제는 그게 **조용하다**는 것이다.
@@ -74,7 +98,7 @@ _null_key_total = 0
 
 
 def fetch_and_send():
-    global _last_snapshot_time, _null_key_total
+    global _sent_watermark, _null_key_total, _skipped_repeat_total, _skipped_older_total
     null_key_batch = 0
     try:
         response = session.get(URL, params=PARAMS, timeout=10)
@@ -86,8 +110,16 @@ def fetch_and_send():
             return
 
         snapshot_time = data.get('time')
-        if snapshot_time is not None and snapshot_time == _last_snapshot_time:
+        decision = snapshot_decision(snapshot_time, _sent_watermark)
+        if decision == "repeat":
+            _skipped_repeat_total += 1
             print(f"[{datetime.now()}] 이전과 동일한 스냅샷(time={snapshot_time}) — 전송 생략.")
+            return
+        if decision == "older":
+            # 원인 판별용 기록(2026-10-10): 오래된 스냅샷이 늦게 온 사례만 따로 센다. 발생할 때만 남긴다.
+            _skipped_older_total += 1
+            print(f"SNAPSHOT_OLDER_SKIPPED time={snapshot_time} watermark={_sent_watermark} "
+                  f"behind_s={_sent_watermark - snapshot_time} total={_skipped_older_total}")
             return
 
         states = data['states']
@@ -113,7 +145,9 @@ def fetch_and_send():
 
         producer.flush() # 메시지 전송 보장
         # flush 성공 후에만 갱신 — 전송에 실패했다면 다음 주기에 같은 스냅샷을 다시 시도해야 한다.
-        _last_snapshot_time = snapshot_time
+        # 'send' 판정은 워터마크보다 늦은 경우뿐이라 그대로 덮어써도 최댓값이 유지된다.
+        if snapshot_time is not None:
+            _sent_watermark = snapshot_time
         print(f"[{datetime.now()}] {len(states)}개의 항공기 정보를 전송했습니다.")
 
     except Exception as e:
