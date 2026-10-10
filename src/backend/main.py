@@ -43,12 +43,30 @@ engine = create_engine(DB_URL)
 # — 이전에는 이 보장이 조회 쪽 관례(쿼리를 이렇게 짜야 한다는 약속)에만 있었다.
 # ORDER BY는 결과 순서를 안정적으로 만들 뿐 중복 제거와는 무관하다.
 # 궤적(TRAIL_QUERY)은 이력이 필요하므로 flight_data를 그대로 쓴다 — 변경 없음.
+# 1-A B-1 (2026-10-10): on_ground·vertical_rate·squawk를 함께 내보내고, 고도는 GPS 고도(geo_altitude)가
+# 없으면 기압 고도(baro_altitude)로 채운다. 실데이터(Bronze 7일 140,823행): geo_altitude null 22.0%, 그중
+# 거의 전부가 지상기(지상 21.8%) — 화면이 지상기를 "0 m"로 평균에 넣던 문제(F-1)를 고치려면 지상 여부가 필요하다.
+# 비행 중인데 GPS 고도만 없고 기압 고도는 있는 경우(1.25%)는 대체로 채워진다.
 FLIGHTS_QUERY = text("""
-    SELECT icao24, callsign, origin_country, latitude, longitude, velocity, geo_altitude as altitude, timestamp, true_track
+    SELECT icao24, callsign, origin_country, latitude, longitude, velocity,
+           COALESCE(geo_altitude, baro_altitude) AS altitude, timestamp, true_track,
+           on_ground, vertical_rate, squawk
     FROM flight_current
     WHERE timestamp >= NOW() - INTERVAL '5 minutes'
     ORDER BY icao24
 """)
+
+
+def iso_utc(ts):
+    """1-A B-2 (2026-10-10): 시각을 UTC 표시(Z)를 붙인 ISO 문자열로.
+
+    Postgres 컬럼은 timestamp without time zone에 UTC 값을 담는다. 그대로 직렬화하면 오프셋 없는 문자열이
+    나가고, 브라우저는 이를 현지 시각으로 해석해 9시간 어긋난다(실제로 화면 버그였다 — 2026-10-03).
+    여기서 Z를 붙이면 어떤 클라이언트가 읽어도 UTC로 해석된다. 화면의 parseUtc()는 두 형식을 모두 처리한다.
+    """
+    if ts is None:
+        return None
+    return ts.isoformat() + "Z" if ts.tzinfo is None else ts.isoformat()
 
 
 def fetch_flights():
@@ -64,8 +82,11 @@ def fetch_flights():
                 "longitude": row.longitude,
                 "velocity": row.velocity,
                 "altitude": row.altitude,
-                "timestamp": row.timestamp,
+                "timestamp": iso_utc(row.timestamp),
                 "true_track": row.true_track,
+                "on_ground": row.on_ground,
+                "vertical_rate": row.vertical_rate,
+                "squawk": row.squawk,
             }
             for row in result
         ]
@@ -74,6 +95,30 @@ def fetch_flights():
 @app.get("/")
 def read_root():
     return {"message": "Flight Tracker API is running!"}
+
+
+# 1-A B-3 (2026-10-10): 상태 확인. 세션 시작 직후 /flights가 500을 낼 때 "DB가 죽었나 / 테이블이 아직
+# 없나(Spark 첫 배치 전)"를 바로 구분하려고 만든다. I-2(컨테이너 헬스체크)도 이것을 쓴다.
+#   - DB에 닿으면 200, 못 닿으면 503 — 헬스체크는 "서버와 DB가 살아 있나"만 본다.
+#   - 데이터 신선도는 본문으로 알려 준다: starting(테이블 없음) / ok(2분 이내) / stale(그보다 오래됨).
+HEALTH_STALE_S = 120
+
+
+@app.get("/health")
+def health():
+    try:
+        with engine.connect() as conn:
+            if conn.execute(text("SELECT to_regclass('public.flight_current')")).scalar() is None:
+                return {"status": "starting", "db": True, "last_data_utc": None, "data_age_s": None}
+            row = conn.execute(text(
+                "SELECT max(timestamp) AS last, "
+                "EXTRACT(EPOCH FROM (NOW()::timestamp - max(timestamp))) AS age FROM flight_current"
+            )).one()
+    except Exception as e:  # noqa: BLE001 — 상태 확인은 실패 원인 종류만 알려 준다
+        return JSONResponse({"status": "down", "db": False, "error": type(e).__name__}, status_code=503)
+    age = round(float(row.age), 1) if row.age is not None else None
+    status = "starting" if age is None else ("ok" if age <= HEALTH_STALE_S else "stale")
+    return {"status": status, "db": True, "last_data_utc": iso_utc(row.last), "data_age_s": age}
 
 
 @app.get("/flights")
@@ -112,7 +157,7 @@ def get_flight_trail(icao24: str, minutes: int = 30):
             {
                 "latitude": row.latitude,
                 "longitude": row.longitude,
-                "timestamp": row.timestamp,
+                "timestamp": iso_utc(row.timestamp),
             }
             for row in result
         ]
