@@ -43,7 +43,7 @@ Bronze에 데이터가 쌓이고, 껐다 켜기를 반복한다. 즉 Bronze에 �
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import boto3
 from airflow import DAG
@@ -79,9 +79,20 @@ SPARK_PACKAGES = ",".join(
     ]
 )
 
+# 1-A A-1·A-2 (2026-10-10, 사용자 채택)
+# A-1 execution_timeout: 태스크마다 실행 시간 상한을 둔다. 전에는 상한이 없었는데 이 DAG는
+#   max_active_runs=1이라 Spark 작업 하나가 멈추면 그 실행이 끝나지 않아 다음 실행이 전부 막히고,
+#   재학습 worker도 "DAG 실행 중"으로 계속 거절한다(src/ml_worker.py가 dag_run 상태를 본다).
+#   실측: 한 날짜의 Silver 약 5분(2026-10-10), Gold·병합도 같은 규모. 45분이면 여러 배 여유가 있고,
+#   넘으면 멈춘 것으로 보고 실패 처리 → 아래 재시도. 끊긴 Spark 작업은 완료 표시가 없어 다시 처리되고
+#   날짜 단위 덮어쓰기라 중복이 생기지 않는다.
+# A-2 retry_delay: 재시도 간격을 명시한다(값은 Airflow 기본과 같은 5분 — 의도를 코드에 드러내기 위함).
+#   MinIO·Spark의 일시적 오류가 가라앉을 시간이다.
 default_args = {
     "owner": "airflow",
     "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+    "execution_timeout": timedelta(minutes=45),
 }
 
 

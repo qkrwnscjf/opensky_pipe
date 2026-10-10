@@ -610,6 +610,54 @@ def export_report():
         print(f"ML_REPORT_EXPORTED[{job}] runs={len(runs_out)} champion=v{champion} file={cfg['report_file']}")
 
 
+# 1-A M-1 (2026-10-10, 사용자 채택): 학습이 끝날 때마다 mlflow.db를 MinIO에 백업한다.
+# 영구 저장소가 MinIO와 mlflow_data 두 개인데, mlflow_data만 지워지면(down -v, volume prune --all)
+# MinIO의 모델 파일은 남아도 "어느 실행의 어떤 버전인지"라는 기록이 사라져 짝이 끊긴다. 백업이 MinIO에
+# 있으면 MinIO 하나로 둘 다 되살릴 수 있다. 파일을 그대로 복사하지 않고 SQLite 백업 API로 사본을 만든다
+# — 서빙이 동시에 쓰고 있어도 일관된 스냅샷이 된다. 수 MB 파일이라 메모리·시간 부담은 미미하고,
+# 디스크가 계속 늘지 않도록 최근 MLFLOW_BACKUP_KEEP개만 남긴다.
+MLFLOW_BACKUP_PREFIX = "mlflow_backups"
+MLFLOW_BACKUP_KEEP = int(os.getenv("MLFLOW_BACKUP_KEEP", "5"))
+
+
+def backup_mlflow_db():
+    import sqlite3
+    import tempfile
+
+    import boto3
+
+    if not TRACKING_URI.startswith("sqlite:///"):
+        print("MLFLOW_BACKUP_SKIPPED not a sqlite tracking store")
+        return
+    src_path = TRACKING_URI[len("sqlite:///"):]
+    if not os.path.exists(src_path):
+        print("MLFLOW_BACKUP_SKIPPED db file missing")
+        return
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
+        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+        aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+    )
+    with tempfile.TemporaryDirectory() as d:
+        snap = os.path.join(d, "mlflow.db")
+        src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+        dst = sqlite3.connect(snap)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        key = f"{MLFLOW_BACKUP_PREFIX}/mlflow-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.db"
+        s3.upload_file(snap, LAKE_BUCKET, key)
+        size = os.path.getsize(snap)
+    keys = sorted(o["Key"] for o in s3.list_objects_v2(Bucket=LAKE_BUCKET, Prefix=f"{MLFLOW_BACKUP_PREFIX}/").get("Contents", []))
+    old = keys[:-MLFLOW_BACKUP_KEEP] if len(keys) > MLFLOW_BACKUP_KEEP else []
+    for k in old:
+        s3.delete_object(Bucket=LAKE_BUCKET, Key=k)
+    print(f"MLFLOW_BACKUP_SAVED key={key} bytes={size} kept={len(keys) - len(old)} removed={len(old)}")
+
+
 def main(argv):
     target = argv[1] if len(argv) > 1 else "all"
     if target not in ("all", "next_report", "compare_10s", "export"):
@@ -625,6 +673,11 @@ def main(argv):
             job_compare_10s(con, dates)
         print(f"ML_JOBS_DONE target={target} seconds={time.perf_counter() - t0:.1f}")
     export_report()
+    if target != "export":
+        try:
+            backup_mlflow_db()
+        except Exception as e:  # noqa: BLE001 — 백업 실패가 학습 성공을 뒤집지 않게
+            print(f"MLFLOW_BACKUP_FAILED {type(e).__name__}")
 
 
 if __name__ == "__main__":

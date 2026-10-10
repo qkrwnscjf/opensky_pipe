@@ -42,6 +42,14 @@ const ALTITUDE_BANDS = [
 const bandFor = (altitude) =>
   ALTITUDE_BANDS.find((b) => (altitude ?? 0) < b.max) || ALTITUDE_BANDS[ALTITUDE_BANDS.length - 1];
 
+// 1-A F-1 (2026-10-10): 지상 항공기는 고도대 대신 "지상"으로 다룬다. backend가 on_ground를 내보낸다(B-1).
+// 전에는 지상기의 고도(null)를 0 m로 보고 저고도 색·"0 m" 표시·평균 고도 계산에 넣었다 — 실데이터상
+// 약 22%가 지상기라 평균 고도가 실제보다 낮게 나왔다.
+const GROUND_BAND = { key: 'ground', label: 'On ground', color: '#94a3b8' };
+const isGrounded = (f) => f.on_ground === true;
+const bandOf = (f) => (isGrounded(f) ? GROUND_BAND : bandFor(f.altitude));
+const altText = (f) => (isGrounded(f) ? 'Ground' : f.altitude == null ? '—' : `${Math.round(f.altitude).toLocaleString()} m`);
+
 const DEMO_STEPS = [
   { label: 'Search & Discover' },
   { label: 'Track Live' },
@@ -76,7 +84,7 @@ function MapFocusHandler({ center, mode }) {
 }
 
 const aircraftIcon = (flight, active, theme) => {
-  const color = bandFor(flight.altitude).color;
+  const color = bandOf(flight).color;
   const stroke = theme === 'dark' ? '#061018' : '#ffffff';
   const heading = flight.true_track;
   return L.divIcon({
@@ -179,6 +187,7 @@ function App() {
   const [query, setQuery] = useState('');
   const [countryFilter, setCountryFilter] = useState('all');
   const [sortKey, setSortKey] = useState('icao');
+  const [airborneOnly, setAirborneOnly] = useState(false); // F-1: 지상기 숨기기(지도·목록 공통)
   const [connected, setConnected] = useState(true);
   const [clock, setClock] = useState(new Date());
   const [theme, setTheme] = useState(readInitialTheme);
@@ -270,7 +279,7 @@ function App() {
 
   const filteredFlights = useMemo(() => {
     const q = query.trim().toLowerCase();
-    let base = flights;
+    let base = airborneOnly ? flights.filter((f) => !isGrounded(f)) : flights;
     if (countryFilter !== 'all') {
       base = base.filter((f) => (f.country || 'Unknown') === countryFilter);
     }
@@ -303,16 +312,19 @@ function App() {
     return [...sorted].sort(
       (a, b) => (pinned.has(b.icao24) ? 1 : 0) - (pinned.has(a.icao24) ? 1 : 0)
     );
-  }, [flights, query, pinned, countryFilter, sortKey]);
+  }, [flights, query, pinned, countryFilter, sortKey, airborneOnly]);
 
   const stats = useMemo(() => {
     if (flights.length === 0) return { count: 0, avgAlt: 0, avgSpd: 0, countries: 0 };
-    const altSum = flights.reduce((s, f) => s + (f.altitude || 0), 0);
+    // 평균 고도는 비행 중이고 고도가 있는 항공기만으로 낸다(지상기·고도 미상은 제외 — F-1)
+    const airborne = flights.filter((f) => !isGrounded(f) && f.altitude != null);
+    const altSum = airborne.reduce((s, f) => s + f.altitude, 0);
     const spdSum = flights.reduce((s, f) => s + (f.velocity || 0), 0);
     const countries = new Set(flights.map((f) => f.country).filter(Boolean));
     return {
       count: flights.length,
-      avgAlt: Math.round(altSum / flights.length),
+      avgAlt: airborne.length ? Math.round(altSum / airborne.length) : 0,
+      grounded: flights.filter(isGrounded).length,
       avgSpd: Math.round(spdSum / flights.length),
       countries: countries.size,
     };
@@ -482,7 +494,7 @@ function App() {
                 {countAlt.toLocaleString()}
                 <span className="stat-unit">m</span>
               </div>
-              <div className="stat-label">Avg. Altitude</div>
+              <div className="stat-label">Avg. Altitude · airborne</div>
             </div>
             <div className="stat-card">
               <div className="stat-value">
@@ -661,7 +673,7 @@ function App() {
                 }}
               />
             )}
-            {flights.map((flight) => (
+            {(airborneOnly ? flights.filter((f) => !isGrounded(f)) : flights).map((flight) => (
               <Marker
                 key={flight.icao24}
                 position={[flight.latitude, flight.longitude]}
@@ -671,12 +683,12 @@ function App() {
                 {/* 호버 정보 — flights가 push마다 갱신되므로 띄워 둔 채로도 값이 실시간으로 바뀐다 */}
                 <Tooltip direction="top" offset={[0, -14]} className="flight-tip">
                   <div className="tip-head">
-                    <span className="tip-band" style={{ background: bandFor(flight.altitude).color }} />
+                    <span className="tip-band" style={{ background: bandOf(flight).color }} />
                     <b>{flight.callsign || 'N/A'}</b>
                     <span className="tip-icao">{flight.icao24}</span>
                   </div>
                   <div className="tip-grid">
-                    <span>ALT</span><b>{Math.round(flight.altitude ?? 0).toLocaleString()} m</b>
+                    <span>ALT</span><b>{altText(flight)}</b>
                     <span>SPD</span><b>{Math.round((flight.velocity ?? 0) * 3.6).toLocaleString()} km/h</b>
                     <span>HDG</span><b>{Math.round(flight.true_track ?? 0)}°</b>
                     <span>AIRLINE</span><b>{flight.airline || '—'}</b>
@@ -705,7 +717,7 @@ function App() {
           </div>
 
           <div className="map-legend">
-            {ALTITUDE_BANDS.map((band) => (
+            {[...ALTITUDE_BANDS, GROUND_BAND].map((band) => (
               <div className="legend-item" key={band.key}>
                 <span className="legend-swatch" style={{ background: band.color }} />
                 {band.label}
@@ -784,6 +796,10 @@ function App() {
               <option value="callsign">Sort: Callsign</option>
               <option value="altitude">Sort: Altitude ↓</option>
             </select>
+            <label className="fleet-toggle" title="Hide aircraft on the ground (map and list)">
+              <input type="checkbox" checked={airborneOnly} onChange={(e) => setAirborneOnly(e.target.checked)} />
+              Airborne only{stats.grounded ? ` (${stats.grounded} on ground)` : ''}
+            </label>
             {pinned.size > 0 && (
               <span className="fleet-pinned-count" title="Pinned aircraft">★ {pinned.size}</span>
             )}
@@ -843,7 +859,7 @@ function App() {
                 className={`fleet-card ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}`}
                 onClick={() => handleSelect(flight)}
               >
-                <span className="fleet-band" style={{ background: bandFor(flight.altitude).color }} />
+                <span className="fleet-band" style={{ background: bandOf(flight).color }} />
                 <button
                   className={`pin-btn ${isPinned ? 'active' : ''}`}
                   onClick={(e) => togglePin(flight.icao24, e)}
@@ -864,7 +880,7 @@ function App() {
                 <div className="fleet-card-details">
                   <div>
                     <span>ALT</span>
-                    <b>{Math.round(flight.altitude ?? 0).toLocaleString()} m</b>
+                    <b>{altText(flight)}</b>
                   </div>
                   <div>
                     <span>SPD</span>

@@ -170,6 +170,17 @@ services:
     volumes:
       - /var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
+    # 1-A I-2 (2026-10-10): 준비 상태 확인. pg_isready는 아주 가벼운 명령(접속만 시도)이다.
+    # -h 127.0.0.1(TCP)로 묻는 이유: 공식 이미지는 초기화(initdb) 중 유닉스 소켓만 여는 임시 서버를
+    # 먼저 띄운다. 소켓으로 물으면 그 임시 서버에 "준비됨"이 나와, db/init 스크립트가 끝나기 전에
+    # healthy가 될 수 있다. TCP는 본 서버만 열기 때문에 진짜 준비된 뒤에만 통과한다.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${DB_USER:-myuser} -d ${DB_NAME:-flightdb}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
 
   # 5. MinIO 버킷 초기화 (data lake 버킷을 미리 만들어둠 - 없으면 Spark 저장이 계속 실패함)
   minio-init:
@@ -321,8 +332,21 @@ services:
       - DB_NAME=${DB_NAME:-flightdb}
       # 재학습 요청을 넘길 내부 주소(0-8 2단계). ml-worker는 포트를 공개하지 않는다.
       - ML_WORKER_URL=http://ml-worker:8001
+    # 1-A I-2 (2026-10-10): Postgres가 실제로 준비된 뒤 시작한다. 이전에는 컨테이너가 뜨기만 하면
+    # 시작해서, 세션 첫 기동 때 LISTEN 스레드가 연결 실패 → 5초 뒤 재시도를 반복할 수 있었다(복구는 됐다).
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    # 상태 확인은 1-A B-3의 /health를 쓴다. DB에 닿으면 200(테이블이 아직 없어도 starting으로 200),
+    # 못 닿으면 503 → 상태 코드만으로 판단한다. 이미지에 curl이 없어 파이썬 표준 라이브러리로 묻는다.
+    # 파이썬을 매번 띄우는 비용(순간 수십 MB)이 있어 간격을 30초로 둔다.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+      start_interval: 3s
 
   # 9. Airflow — 콜드 패스 배치 ETL 오케스트레이터 (2026-09-18, 0-6)
   #
