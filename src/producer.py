@@ -74,6 +74,49 @@ _skipped_repeat_total = 0
 _skipped_older_total = 0
 
 
+# 1-7 (2026-10-11, 사용자 결정): 요청 시각을 OpenSky 스냅샷 시각에 맞춘다.
+#
+# 예전 방식(fixed)은 "요청이 끝난 뒤 10초 쉬기"라 실제 주기가 약 10.3초였고, 요청 시점이 OpenSky가 새
+# 스냅샷을 내놓는 시점과 무관하게 흘러갔다. 그래서 가져온 스냅샷의 나이에 "수집 대기" 0~10초(평균 약 5초)가
+# 그대로 더해졌다 — 종단 지연에서 파이프라인 바깥의 가장 큰 덩어리다.
+#
+# aligned 방식: 방금 보낸 스냅샷 시각 T를 기준으로 다음 요청을 T + 10초 + offset에 맞춘다.
+#   - 새 스냅샷이 왔으면 offset을 조금(-0.1초) 당긴다 → 공개 직후로 점점 다가간다.
+#   - 아직 갱신 전(같은/더 오래된 스냅샷)이면 offset을 1초 늦추고 1.5초 뒤 한 번만 다시 묻는다.
+#   당기기 0.1 / 늦추기 1.0이라 재요청 비율은 대략 10% 근처에서 균형을 이룬다(요청 수 약 +10%).
+# 재요청 뒤에도 갱신 전이거나 오류면 다음 칸(T + 10초의 배수 + offset)으로 넘어간다 — 연속 재요청은 없다.
+# 되돌리기: PRODUCER_POLL_MODE=fixed (예전 동작 그대로).
+POLL_MODE = os.getenv("PRODUCER_POLL_MODE", "aligned")
+SNAPSHOT_PERIOD_S = 10.0
+ALIGN_OFFSET_INIT_S = 3.0
+ALIGN_OFFSET_MIN_S, ALIGN_OFFSET_MAX_S = 0.5, 12.0
+ALIGN_STEP_EARLIER_S, ALIGN_STEP_LATER_S = 0.1, 1.0
+ALIGN_RETRY_DELAY_S = 1.5
+MIN_REQUEST_GAP_S = 1.0
+
+
+def next_poll_delay(outcome, snapshot_time, state, now):
+    """aligned 방식의 다음 요청까지 대기(초). state: offset, last_sent_time, retried."""
+    if outcome == "sent" and snapshot_time is not None:
+        state["last_sent_time"] = snapshot_time
+        state["offset"] = max(ALIGN_OFFSET_MIN_S, state["offset"] - ALIGN_STEP_EARLIER_S)
+        state["retried"] = False
+        target = snapshot_time + SNAPSHOT_PERIOD_S + state["offset"]
+    elif outcome in ("repeat", "older") and not state["retried"] and state["last_sent_time"] is not None:
+        state["offset"] = min(ALIGN_OFFSET_MAX_S, state["offset"] + ALIGN_STEP_LATER_S)
+        state["retried"] = True
+        target = now + ALIGN_RETRY_DELAY_S
+    else:
+        state["retried"] = False
+        if state["last_sent_time"] is None:
+            target = now + SNAPSHOT_PERIOD_S
+        else:
+            target = state["last_sent_time"] + SNAPSHOT_PERIOD_S + state["offset"]
+            while target < now + MIN_REQUEST_GAP_S:
+                target += SNAPSHOT_PERIOD_S
+    return min(max(target - now, MIN_REQUEST_GAP_S), 15.0)
+
+
 def snapshot_decision(snapshot_time, watermark):
     """'send' | 'repeat'(이미 보낸 것과 같음) | 'older'(이미 보낸 것보다 이름)."""
     if snapshot_time is None or watermark is None:
@@ -107,20 +150,20 @@ def fetch_and_send():
 
         if not data.get('states'):
             print(f"[{datetime.now()}] 감지된 항공기 없음.")
-            return
+            return "empty", data.get('time')
 
         snapshot_time = data.get('time')
         decision = snapshot_decision(snapshot_time, _sent_watermark)
         if decision == "repeat":
             _skipped_repeat_total += 1
             print(f"[{datetime.now()}] 이전과 동일한 스냅샷(time={snapshot_time}) — 전송 생략.")
-            return
+            return "repeat", snapshot_time
         if decision == "older":
             # 원인 판별용 기록(2026-10-10): 오래된 스냅샷이 늦게 온 사례만 따로 센다. 발생할 때만 남긴다.
             _skipped_older_total += 1
             print(f"SNAPSHOT_OLDER_SKIPPED time={snapshot_time} watermark={_sent_watermark} "
                   f"behind_s={_sent_watermark - snapshot_time} total={_skipped_older_total}")
-            return
+            return "older", snapshot_time
 
         states = data['states']
         for state in states:
@@ -149,16 +192,34 @@ def fetch_and_send():
         if snapshot_time is not None:
             _sent_watermark = snapshot_time
         print(f"[{datetime.now()}] {len(states)}개의 항공기 정보를 전송했습니다.")
+        return "sent", snapshot_time
 
     except Exception as e:
         print(f"데이터 수집 중 오류 발생: {e}")
+        return "error", None
 
 if __name__ == "__main__":
     print(f"수집 범위: Lat({LAT_MIN}~{LAT_MAX}), Lon({LON_MIN}~{LON_MAX})")
+    print(f"요청 방식: {POLL_MODE}")
+    align = {"offset": ALIGN_OFFSET_INIT_S, "last_sent_time": None, "retried": False}
     try:
         while True:
-            fetch_and_send()
-            time.sleep(10) # 10초 주기로 수집
+            fetched_at = time.time()
+            outcome, snap = fetch_and_send()
+            now = time.time()
+            if POLL_MODE == "fixed":
+                delay = 10.0  # 예전 동작: 요청이 끝난 뒤 10초 (실제 주기 약 10.3초)
+            else:
+                delay = next_poll_delay(outcome, snap, align, now)
+            # 1-8 측정용: 요청마다 한 줄. age_s = 요청 시각 - 스냅샷 시각(가져온 순간의 데이터 나이).
+            print("POLL_METRIC " + json.dumps({
+                "mode": POLL_MODE, "outcome": outcome, "snapshot_time": snap,
+                "fetched_at": round(fetched_at, 3),
+                "age_s": round(fetched_at - snap, 2) if snap else None,
+                "offset_s": round(align["offset"], 2) if POLL_MODE != "fixed" else None,
+                "next_in_s": round(delay, 2),
+            }))
+            time.sleep(delay)
     except KeyboardInterrupt:
         print("Producer 종료")
     finally:

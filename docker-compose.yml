@@ -213,6 +213,8 @@ services:
       "
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      # 1-7: aligned = 스냅샷 시각에 맞춰 요청(기본), fixed = 예전 동작(요청 후 10초 대기)
+      - PRODUCER_POLL_MODE=${PRODUCER_POLL_MODE:-aligned}
       - OPENSKY_USER=${OPENSKY_USER:-}
       - OPENSKY_PASSWORD=${OPENSKY_PASSWORD:-}
     depends_on:
