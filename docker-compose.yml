@@ -286,6 +286,16 @@ services:
       # 영구 보관이라 그대로 누적된다. 데이터 신선도는 이득이 없다 — 콜드의 유일한
       # 소비자는 하루 한 번 도는 배치 ETL이다.
       - COLD_TRIGGER=${COLD_TRIGGER:-60 seconds}
+      # 1-22: 0이면 Hot 쓰기 연결을 매번 새로 연다(예전 동작, 되돌리기용)
+      - HOT_PG_REUSE=${HOT_PG_REUSE:-1}
+    # 1-21: Hot 쓰기가 실패해 재시도 중이면 unhealthy. spark_dual_write.py가 쓰기 시도마다 /tmp/hot_status.json에
+    # 결과를 남긴다(파일이 아직 없으면 = 첫 배치 전 → healthy). 재시작은 하지 않고 표시만 한다.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,os,sys; p='/tmp/hot_status.json'; sys.exit(0 if not os.path.exists(p) or json.load(open(p)).get('ok') else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 1
+      start_period: 60s
     # 2026-09-09 spark가 OOMKilled(exit 137)로 죽었는데, 한도가 없어서 "spark 자체가
     # 자란 것"인지 "Docker VM 전체가 압박받은 것"인지 구분할 수 없었다. 한도를 명시해야
     # OOM이 재현 가능하고 귀속 가능한 사건이 된다. 실측 최대치가 1,213MiB(20배 부하,

@@ -36,6 +36,11 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("WARN")
 
+# 1-22: worker에서 import할 연결 재사용 모듈을 보낸다(src/hot_pg.py 참고). HOT_PG_REUSE=0이면 예전처럼 매번 새 연결.
+HOT_PG_REUSE = os.getenv("HOT_PG_REUSE", "1") == "1"
+spark.sparkContext.addPyFile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "hot_pg.py"))
+print(f"HOT_PG_REUSE={HOT_PG_REUSE}")
+
 # ---------------------------------------------------------------
 # 2. 스키마 정의 (Kafka에서 들어오는 raw JSON 형태)
 # ---------------------------------------------------------------
@@ -395,11 +400,24 @@ def write_hot_tables(batch_df):
         f"INSERT INTO flight_data ({', '.join(hist_cols)}) VALUES %s "
         f"ON CONFLICT (icao24, time_position) DO NOTHING"
     )
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME", "flightdb")
-    db_user = os.getenv("DB_USER", "myuser")
-    db_password = os.getenv("DB_PASSWORD", "mypassword")
+    params = dict(host=os.getenv("DB_HOST", "localhost"), port=os.getenv("DB_PORT", "5432"),
+                  dbname=os.getenv("DB_NAME", "flightdb"), user=os.getenv("DB_USER", "myuser"),
+                  password=os.getenv("DB_PASSWORD", "mypassword"))
+    reuse = HOT_PG_REUSE
+
+    def _write_both(conn, hist_values, values):
+        # 두 테이블을 한 트랜잭션으로 — 이력과 현재 상태가 같은 배치 내용으로 함께 커밋되거나 함께 실패한다.
+        try:
+            with conn.cursor() as cur:
+                execute_values(cur, hist_sql, hist_values, page_size=1000)
+                execute_values(cur, sql, values)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def _write_partition(rows):
         # 배치 안의 중복 icao24를 먼저 접는다 (2026-09-17 실행 중 발견한 문제).
@@ -439,16 +457,22 @@ def write_hot_tables(batch_df):
         hist_values = [tuple(row[c] for c in hist_cols) for row in first_seen.values()]
         if not values:
             return
-        conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name,
-                                 user=db_user, password=db_password)
+        if not reuse:
+            conn = psycopg2.connect(**params)
+            try:
+                _write_both(conn, hist_values, values)
+            finally:
+                conn.close()
+            return
+        # 1-22: worker에 남아 있는 연결을 쓴다. Postgres가 재시작됐으면 그 연결은 죽어 있어 첫 사용에서
+        # OperationalError/InterfaceError가 난다 → 버리고 새 연결로 한 번만 다시 한다. 다른 오류(데이터·SQL)는
+        # 그대로 올려 save_to_hot의 재시도(1-17)에 맡긴다.
+        import hot_pg
         try:
-            # 두 테이블을 한 트랜잭션으로 — 이력과 현재 상태가 같은 배치 내용으로 함께 커밋되거나 함께 실패한다.
-            with conn.cursor() as cur:
-                execute_values(cur, hist_sql, hist_values, page_size=1000)
-                execute_values(cur, sql, values)
-            conn.commit()
-        finally:
-            conn.close()
+            _write_both(hot_pg.get(params), hist_values, values)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            hot_pg.discard()
+            _write_both(hot_pg.get(params), hist_values, values)
 
     batch_df.select(*sorted(set(cur_cols) | set(hist_cols))).foreachPartition(_write_partition)
 
@@ -515,6 +539,21 @@ COLD_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/positions")
 
 
 HOT_WRITE_RETRY_DELAYS_S = (1, 2, 4, 8, 15, 15, 15)  # 재시도 간격(초), 합계 60초 — 1-17
+
+# 1-21: 마지막 Hot 쓰기 결과. compose의 spark healthcheck가 읽는다(ok=false면 unhealthy).
+# 1-17 이후 '계속되는' 실패는 재시작으로 드러나지만, 재시도 중인 최대 60초는 로그 말고는 보이지 않았다.
+HOT_STATUS_PATH = "/tmp/hot_status.json"
+
+
+def _write_hot_status(ok, batch_id, attempts, error=None):
+    try:
+        tmp = HOT_STATUS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"ok": ok, "batchId": batch_id, "attempts": attempts, "ts": round(time.time(), 1),
+                       "error": error}, f)
+        os.replace(tmp, HOT_STATUS_PATH)  # 반쯤 쓴 파일을 healthcheck가 읽지 않게
+    except Exception as e:
+        print(f"HOT_STATUS_WARNING: {e}")
 
 
 def _reset_table_flags():
@@ -617,12 +656,15 @@ def save_to_hot(batch_df, batch_id):
                 _timed("ensure_current_table", ensure_current_table)
                 _timed("hot_write", lambda: write_hot_tables(batch_df))
                 write_error = None
+                _write_hot_status(True, batch_id, attempts)
                 break
             except Exception as e:
                 write_error = e
                 _reset_table_flags()
+                first_line = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                _write_hot_status(False, batch_id, attempts, first_line)
                 print(f"CRITICAL_SINK_ERROR: batch {batch_id} attempt {attempts}/{len(HOT_WRITE_RETRY_DELAYS_S) + 1}: "
-                      f"{str(e).splitlines()[0][:200]}")
+                      f"{first_line}")
         timings["write_attempts"] = attempts
         if write_error is None:
             _timed("notify", notify_flight_update)
