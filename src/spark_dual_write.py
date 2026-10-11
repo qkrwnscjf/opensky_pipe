@@ -514,6 +514,19 @@ def notify_flight_update():
 COLD_PATH = os.getenv("MINIO_COLD_PATH", "s3a://flight-data-lake/positions")
 
 
+HOT_WRITE_RETRY_DELAYS_S = (1, 2, 4, 8, 15, 15, 15)  # 재시도 간격(초), 합계 60초 — 1-17
+
+
+def _reset_table_flags():
+    """1-20: 쓰기가 실패하면 '테이블 준비됨' 기억을 지워 다음 시도에서 테이블·인덱스를 다시 확인하게 한다.
+
+    예전에는 한 번 True가 되면 끝이라, 세션 중 테이블이 사라지면(postgres만 재생성 등) 다시 만들지 않고
+    모든 쓰기가 실패했다. CREATE ... IF NOT EXISTS라 다시 확인해도 해가 없다."""
+    global _index_ready, _current_table_ready
+    _index_ready = False
+    _current_table_ready = False
+
+
 def save_to_hot(batch_df, batch_id):
     # 핫 패스(Postgres)만 담당한다. 콜드 패스(MinIO)는 별도 스트리밍 쿼리로 분리됐다.
     #
@@ -541,11 +554,17 @@ def save_to_hot(batch_df, batch_id):
     #
     # 사유를 나누는 이유: 총계만으로는 "좌표 없는 정상 레코드"와 "스키마가 어긋나
     # 파싱이 통째로 실패한 레코드"를 구분할 수 없다. 후자는 파이프라인 결함이다.
+    # 1-19 (2026-10-11): Hot은 icao24 없는 행도 뺀다. flight_current의 기본키라 한 행만 섞여도 그 파티션의
+    # 트랜잭션 전체가 실패해 같은 파티션의 정상 항공기까지 못 쓰였다(합성 주입 실측: 1행 때문에 30행 유실).
+    # parse_and_flag의 _valid는 그대로 둔다 — Cold(Bronze)는 받은 그대로 보관한다(사용자 결정 10-11).
+    hot_valid = col("_valid") & col("icao24").isNotNull()
     stats = _timed("count", lambda: batch_df.agg(
         _count(lit(1)).alias("total"),
-        _sum(when(col("_valid"), 1).otherwise(0)).alias("valid"),
-        # icao24까지 null이면 레코드 자체가 파싱되지 않았을 가능성이 크다.
-        _sum(when(col("icao24").isNull(), 1).otherwise(0)).alias("unparsed"),
+        _sum(when(hot_valid, 1).otherwise(0)).alias("valid"),
+        # icao24·좌표가 모두 null이면 레코드 자체가 파싱되지 않았을 가능성이 크다.
+        _sum(when(col("icao24").isNull() & col("latitude").isNull(), 1).otherwise(0)).alias("unparsed"),
+        # 좌표는 있는데 icao24만 없는 행 — 파싱은 됐지만 Hot에는 넣을 수 없다.
+        _sum(when(col("icao24").isNull() & col("latitude").isNotNull(), 1).otherwise(0)).alias("no_key"),
         _sum(when(col("icao24").isNotNull()
                   & (col("latitude").isNull() | col("longitude").isNull()),
                   1).otherwise(0)).alias("no_coord"),
@@ -560,7 +579,7 @@ def save_to_hot(batch_df, batch_id):
     if dropped:
         # 발생했을 때만 남긴다. 정상일 때 0을 계속 찍으면 아무도 읽지 않게 된다.
         print(f"DROP_WARNING: {dropped}/{total}건 제외 "
-              f"(파싱실패 {stats['unparsed'] or 0}, 좌표없음 {stats['no_coord'] or 0}, "
+              f"(파싱실패 {stats['unparsed'] or 0}, 키없음 {stats['no_key'] or 0}, 좌표없음 {stats['no_coord'] or 0}, "
               f"시각없음 {stats['no_time'] or 0}) — batch {batch_id}")
         if stats["unparsed"] and stats["unparsed"] == total:
             # 전량이 파싱 실패면 스키마 드리프트를 의심해야 한다. 조용히 넘기면
@@ -569,21 +588,44 @@ def save_to_hot(batch_df, batch_id):
                   "src/flight_schema.py와 실제 메시지 스키마가 어긋났는지 확인하세요.")
 
     # 이후 쓰기 경로는 유효 레코드만 다룬다.
-    batch_df = batch_df.filter(col("_valid")).drop("_valid")
+    batch_df = batch_df.filter(hot_valid).drop("_valid")
 
+    # 1-17·1-18·1-20 (2026-10-11): 쓰기 실패를 삼키지 않는다.
+    #
+    # 예전에는 except가 로그만 남기고 끝나 Spark가 실패한 배치를 '성공'으로 커밋했다 — 그 배치는 Hot DB에
+    # 영영 안 들어갔다(파티션 일부만 실패하면 일부 항공기만 빠졌다). 실측: Postgres 30초 정지 때 4배치·
+    # 400행 영구 유실, 테이블이 사라지면 다시 만들지 않아 매 배치 실패가 계속됐다.
+    #
+    # 이제: 실패하면 테이블 확인 플래그를 풀고(1-20) 같은 배치를 약 60초 동안 재시도한다 — Postgres 재시작
+    # 같은 일시 장애는 프로세스를 죽이지 않고 넘긴다. 그래도 안 되면 예외를 다시 던진다 → 쿼리 종료 →
+    # awaitAnyTermination → 컨테이너 재시작 → 커밋되지 않은 이 배치를 체크포인트에서 다시 처리한다.
+    # 재처리가 안전한 이유: 쓰기가 멱등이다(flight_data ON CONFLICT DO NOTHING, flight_current는
+    # WHERE timestamp < EXCLUDED.timestamp) — 이미 성공한 파티션을 다시 써도 결과가 같다(1-18).
+    # 대가: Postgres가 60초 넘게 죽어 있으면 spark가 재시작을 반복한다(조용한 유실 대신 드러나는 실패).
+    write_error = None
     if count > 0:
         print(f"[{batch_id}] {count} records processing...")
-        try:
-            # PostgreSQL 저장 — H-1·H-2 (2026-10-10): 두 테이블을 한 번의 Spark 작업·파티션별 한 트랜잭션으로.
-            # 예전 경로: flight_data JDBC append(18개 필드 전부, 스냅샷마다) → flight_current UPSERT(작업 1개 더).
-            # 테이블은 쓰기 전에 만든다 — 이제 JDBC writer가 자동 생성하지 않는다.
-            _timed("ensure_index", ensure_index)
-            _timed("ensure_current_table", ensure_current_table)
-            _timed("hot_write", lambda: write_hot_tables(batch_df))
+        attempts = 0
+        for delay in (0,) + HOT_WRITE_RETRY_DELAYS_S:
+            if delay:
+                time.sleep(delay)
+            attempts += 1
+            try:
+                # PostgreSQL 저장 — H-1·H-2 (2026-10-10): 두 테이블을 한 번의 Spark 작업·파티션별 한 트랜잭션으로.
+                # 테이블은 쓰기 전에 만든다 — 이제 JDBC writer가 자동 생성하지 않는다.
+                _timed("ensure_index", ensure_index)
+                _timed("ensure_current_table", ensure_current_table)
+                _timed("hot_write", lambda: write_hot_tables(batch_df))
+                write_error = None
+                break
+            except Exception as e:
+                write_error = e
+                _reset_table_flags()
+                print(f"CRITICAL_SINK_ERROR: batch {batch_id} attempt {attempts}/{len(HOT_WRITE_RETRY_DELAYS_S) + 1}: "
+                      f"{str(e).splitlines()[0][:200]}")
+        timings["write_attempts"] = attempts
+        if write_error is None:
             _timed("notify", notify_flight_update)
-
-        except Exception as e:
-            print(f"CRITICAL_SINK_ERROR: {e}")
 
     _timed("unpersist", batch_df.unpersist)
 
@@ -594,6 +636,10 @@ def save_to_hot(batch_df, batch_id):
         "numDropped": dropped,
         "ms": timings,
     }, default=str))
+
+    if write_error is not None:
+        print(f"HOT_BATCH_FAILED: batch {batch_id} — 재시도 소진, 쿼리를 종료해 재시작 후 이 배치를 다시 처리합니다.")
+        raise write_error
 
 # ---------------------------------------------------------------
 # A-1 (docs/EXPANSION_PLAN.md): 배치 메트릭 관측
