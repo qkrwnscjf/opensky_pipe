@@ -232,16 +232,24 @@ services:
     # spark_dual_write.py가 awaitAnyTermination으로 두 쿼리를 모두 감시하므로,
     # 핫·콜드 어느 쪽이 죽어도 컨테이너가 종료되고 이 정책이 재시작한다.
     restart: unless-stopped
+    # 1-29 (2026-10-12): 세션 종료(docker compose down/stop) 때 cold에 아직 안 쓴 Kafka 데이터를 마저 쓰고 끝낸다.
+    # 예전에는 bash가 PID 1이라 SIGTERM을 무시했고 10초 뒤 SIGKILL로 죽었다 → 마지막 콜드 배치 이후(최대 60초)
+    # 분량이 다음 세션의 Kafka 초기화와 함께 영구 유실(실측: 종료 전 40초 분량 400행 중 Bronze 0행).
+    #   init: true     — tini가 PID 1이 되어 SIGTERM을 자식에게 전달하고 좀비 프로세스를 거둔다
+    #   exec python    — Python 드라이버가 신호를 직접 받는다(spark-submit 경유면 JVM이 받아 바로 내려간다).
+    #                    패키지는 PYSPARK_SUBMIT_ARGS로 같은 좌표를 넘긴다(Dockerfile의 Ivy 캐시와 일치해야 함)
+    #   stop_grace_period — 마무리 배치를 쓸 시간. 실측 마무리 27~37초·종료 37~49초(10-12) → 여유를 둬 90초
+    init: true
+    stop_grace_period: 90s
     command: >
       bash -c "
       until python -c 'import socket; s = socket.socket(); s.connect((\"kafka\", 29092))' 2>/dev/null; do
         echo 'Waiting for kafka...'; sleep 2;
       done;
-      /home/airflow/.local/bin/spark-submit \
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.6.0 \
-      /opt/airflow/src/spark_dual_write.py
+      exec python /opt/airflow/src/spark_dual_write.py
       "
     environment:
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.6.0 pyspark-shell
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
       - MINIO_ENDPOINT=http://minio:9000
       - MINIO_ACCESS_KEY=${MINIO_USER:-minioadmin}

@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -18,6 +19,12 @@ from flight_schema import FLIGHT_FIELDS, FIELD_NAMES
 # ---------------------------------------------------------------
 # 1. Spark 세션 생성
 # ---------------------------------------------------------------
+# 1-29: JVM을 띄우기 전에 SIGTERM을 '무시'로 둔다. 자식 프로세스(JVM)는 무시 설정을 물려받고, HotSpot은 시작
+# 시점에 무시돼 있는 SIGTERM에는 자기 종료 훅을 걸지 않는다. 그러지 않으면 docker stop의 SIGTERM을 JVM도 받아
+# SparkContext를 먼저 멈춰 버려 마무리 배치(drain_cold)를 쓸 수 없었다(실측: "Cannot call methods on a stopped
+# SparkContext"). 실제 처리기는 맨 아래에서 Python에만 다시 건다.
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
 minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 minio_access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 minio_secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin")
@@ -930,10 +937,57 @@ print("TACTICAL_ETL_SYSTEM: OPERATIONAL")
 # 비정상 종료되고 restart: unless-stopped가 둘 다 다시 띄운다.
 # 대가: 콜드가 결정적으로 실패하면 핫 패스까지 함께 재시작을 반복한다(UI 중단).
 # 이 프로젝트에서는 조용한 소실보다 드러나는 크래시 루프(RestartCount)가 낫다.
+#
+# 1-29 (2026-10-12): 종료 신호(SIGTERM — docker compose down/stop)를 받으면 cold에 남은 것을 쓰고 끝낸다.
+# cold 트리거가 60초라 마지막 콜드 배치 이후 분량은 Kafka에만 있고, 다음 세션은 Kafka를 비우므로 그대로 두면
+# 영구 유실이었다. 신호 처리기는 표시만 하고, 실제 마무리는 메인 루프에서 한다(신호 처리기 안에서 Spark를
+# 호출하지 않기 위해). 마무리: hot·cold를 멈추고 → 같은 체크포인트로 cold를 availableNow(지금 있는 것을
+# 전부 처리하고 끝나는 트리거)로 한 번 돌린다 → 마지막으로 커밋된 지점부터 이어서 쓰므로 빠짐도 겹침도 없다
+# (cold를 배치 도중에 멈췄다면 그 배치는 커밋 전이라 다시 쓰인다 — at-least-once, Silver가 중복 제거).
+COLD_DRAIN_TIMEOUT_S = 70  # compose stop_grace_period(90초) 안에서 끝나도록. 실측 마무리 27~37초(10-12)
+_shutdown = threading.Event()
+
+
+def _on_signal(signum, _frame):
+    print(f"SHUTDOWN_REQUESTED: signal {signum}")
+    _shutdown.set()
+
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGINT, _on_signal)
+
+
+def drain_cold():
+    started = time.time()
+    for q in (hot_query, cold_query):
+        try:
+            q.stop()
+        except Exception as e:
+            print(f"DRAIN_WARNING: stop failed: {e}")
+    final = df_processed.writeStream \
+        .foreachBatch(save_to_cold) \
+        .outputMode("append") \
+        .option("checkpointLocation", cold_checkpoint_dir) \
+        .trigger(availableNow=True) \
+        .start()
+    finished = final.awaitTermination(COLD_DRAIN_TIMEOUT_S)
+    progress = final.recentProgress or []
+    rows = sum(p.get("numInputRows") or 0 for p in progress)
+    print(f"COLD_DRAINED: rows={rows} batches={len(progress)} finished={finished} "
+          f"elapsed_s={round(time.time() - started, 1)}")
+    if not finished:
+        final.stop()
+
+
 try:
-    spark.streams.awaitAnyTermination()
+    while not _shutdown.is_set():
+        if spark.streams.awaitAnyTermination(1):
+            break
+    if _shutdown.is_set():
+        drain_cold()
 finally:
-    for name, q in (("hot", hot_query), ("cold", cold_query)):
-        if not q.isActive:
-            print(f"QUERY_TERMINATED[{name}]: {q.exception()}")
+    if not _shutdown.is_set():
+        for name, q in (("hot", hot_query), ("cold", cold_query)):
+            if not q.isActive:
+                print(f"QUERY_TERMINATED[{name}]: {q.exception()}")
 
