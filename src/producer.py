@@ -117,6 +117,58 @@ def next_poll_delay(outcome, snapshot_time, state, now):
     return min(max(target - now, MIN_REQUEST_GAP_S), 15.0)
 
 
+def seed_watermark_from_kafka(topic="flight_data_raw", timeout_s=5.0):
+    """K-1 (2026-10-11): 재시작 직후 워터마크를 Kafka에 마지막으로 실린 스냅샷 시각으로 채운다.
+
+    워터마크는 메모리에만 있어 producer가 재시작되면 비고, 그 직후 OpenSky가 이미 보낸 스냅샷을
+    다시 주면 한 번 더 전송됐다(P-1이 남긴 빈틈). 파티션마다 마지막 메시지 1건만 읽어 그 timestamp의
+    최댓값을 쓴다 — 읽는 양은 최대 6건.
+    현재 시각보다 크면 현재 시각으로 자른다: 부하 테스트(scripts/load_test_producer.py)는 timestamp에
+    현재 시각을 넣는데, 그 값이 남아 있으면 실제 스냅샷(보통 몇 초 늦음)이 한두 주기 '오래된 것'으로
+    생략될 수 있다. 자르면 그 손실이 최대 한 주기로 한정된다.
+    어떤 이유로든 실패하면 None — 예전처럼 빈 워터마크로 시작할 뿐 수집은 막지 않는다.
+    """
+    from kafka import KafkaConsumer, TopicPartition
+    consumer = None
+    try:
+        consumer = KafkaConsumer(
+            bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+            enable_auto_commit=False,
+            consumer_timeout_ms=int(timeout_s * 1000),
+            api_version=(2, 5, 0),
+        )
+        partitions = consumer.partitions_for_topic(topic)
+        if not partitions:
+            return None
+        tps = [TopicPartition(topic, p) for p in sorted(partitions)]
+        consumer.assign(tps)
+        ends = consumer.end_offsets(tps)
+        pending = {tp for tp in tps if ends[tp] > 0}
+        for tp in pending:
+            consumer.seek(tp, ends[tp] - 1)
+        latest = None
+        deadline = time.time() + timeout_s
+        while pending and time.time() < deadline:
+            for tp, records in consumer.poll(timeout_ms=500).items():
+                for rec in records:
+                    try:
+                        ts = json.loads(rec.value).get("timestamp")
+                    except (ValueError, AttributeError):
+                        ts = None
+                    if isinstance(ts, (int, float)):
+                        latest = ts if latest is None else max(latest, ts)
+                pending.discard(tp)
+        if latest is None:
+            return None
+        return min(int(latest), int(time.time()))
+    except Exception as e:
+        print(f"WATERMARK_SEED_FAILED: {e}")
+        return None
+    finally:
+        if consumer is not None:
+            consumer.close()
+
+
 def snapshot_decision(snapshot_time, watermark):
     """'send' | 'repeat'(이미 보낸 것과 같음) | 'older'(이미 보낸 것보다 이름)."""
     if snapshot_time is None or watermark is None:
@@ -201,7 +253,11 @@ def fetch_and_send():
 if __name__ == "__main__":
     print(f"수집 범위: Lat({LAT_MIN}~{LAT_MAX}), Lon({LON_MIN}~{LON_MAX})")
     print(f"요청 방식: {POLL_MODE}")
-    align = {"offset": ALIGN_OFFSET_INIT_S, "last_sent_time": None, "retried": False}
+    _sent_watermark = seed_watermark_from_kafka()
+    print(f"WATERMARK_SEEDED value={_sent_watermark}"
+          + ("" if _sent_watermark is None else f" age_s={int(time.time()) - _sent_watermark}"))
+    # 시드값이 있으면 요청 시점 계산도 그 스냅샷을 기준으로 시작한다 — 재시작 직후 같은 스냅샷을 받아도 10초를 통째로 기다리지 않게.
+    align = {"offset": ALIGN_OFFSET_INIT_S, "last_sent_time": _sent_watermark, "retried": False}
     try:
         while True:
             fetched_at = time.time()
