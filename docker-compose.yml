@@ -294,6 +294,12 @@ services:
       # 영구 보관이라 그대로 누적된다. 데이터 신선도는 이득이 없다 — 콜드의 유일한
       # 소비자는 하루 한 번 도는 배치 ETL이다.
       - COLD_TRIGGER=${COLD_TRIGGER:-60 seconds}
+      # 1-23 C-4 (2026-10-12): 코드가 읽던 나머지 튜닝 값도 여기서 넘긴다 — A/B 측정 때 코드 수정 없이
+      # `HOT_TRIGGER="2 seconds" docker compose up -d spark`처럼 바꿀 수 있게. 기본값은 코드 기본값과 같다.
+      - HOT_TRIGGER=${HOT_TRIGGER:-3 seconds}
+      - KAFKA_MAX_OFFSETS=${KAFKA_MAX_OFFSETS:-500}
+      - KAFKA_MAX_OFFSETS_COLD=${KAFKA_MAX_OFFSETS_COLD:-5000}
+      - KAFKA_FETCH_MAX_WAIT_MS=${KAFKA_FETCH_MAX_WAIT_MS:-50}
       # 1-22: 0이면 Hot 쓰기 연결을 매번 새로 연다(예전 동작, 되돌리기용)
       - HOT_PG_REUSE=${HOT_PG_REUSE:-1}
     # 1-21: Hot 쓰기가 실패해 재시도 중이면 unhealthy. spark_dual_write.py가 쓰기 시도마다 /tmp/hot_status.json에
