@@ -235,98 +235,114 @@ def build_traffic_hourly(positions_today):
 
 
 def main():
+    # 1-27 (2026-10-12): 날짜 여러 개를 SparkSession 하나로 오름차순 처리(spark_batch_etl.py와 같은 방식).
+    # Gold D는 Silver D-1만 읽으므로(Gold D-1이 아님) 순서가 결과를 바꾸지 않는다.
     parser = argparse.ArgumentParser(description="Silver → Gold 일배치 ETL")
-    parser.add_argument("--date", required=True, help="처리할 날짜 (YYYY-MM-DD)")
+    parser.add_argument("--date", required=True, nargs="+", help="처리할 날짜 (YYYY-MM-DD), 여러 개 가능")
     args = parser.parse_args()
-    validate_date(args.date)
+    dates = sorted(set(args.date))
+    for d in dates:
+        validate_date(d)
 
-    date_str = args.date
+    spark = build_spark(f"flight_gold_etl_{dates[0]}" + (f"..{dates[-1]}" if len(dates) > 1 else ""))
+    spark.sparkContext.setLogLevel("WARN")
+    failed = []
+    try:
+        for date_str in dates:
+            try:
+                run_date(spark, date_str)
+            except Exception as e:
+                failed.append(date_str)
+                print(f"GOLD_DATE_FAILED: date={date_str} ({str(e).splitlines()[0][:200] if str(e) else type(e).__name__})")
+            finally:
+                spark.catalog.clearCache()  # 날짜마다 cache()한 것을 풀어 다음 날짜가 메모리를 이어받지 않게
+    finally:
+        spark.stop()
+    print(f"GOLD_BATCH_DONE: dates={len(dates)} failed={failed}")
+    if failed:
+        sys.exit(1)
+
+
+def run_date(spark, date_str):
     prev_str = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     midnight_epoch = int(
         datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
     )
     print(f"GOLD_START: date={date_str} context={prev_str} source={SILVER_TABLE}")
 
-    spark = build_spark(f"flight_gold_etl_{date_str}")
-    spark.sparkContext.setLogLevel("WARN")
+    if not spark.catalog.tableExists(SILVER_TABLE):
+        print(f"GOLD_SOURCE_MISSING: {SILVER_TABLE} 없음 — Silver가 먼저 돌아야 한다")
+        raise RuntimeError(f"{SILVER_TABLE} missing")
 
-    try:
-        if not spark.catalog.tableExists(SILVER_TABLE):
-            print(f"GOLD_SOURCE_MISSING: {SILVER_TABLE} 없음 — Silver가 먼저 돌아야 한다")
-            sys.exit(1)
-
-        # ── 1. Silver 읽기: D와 D-1 ──────────────────────────────
-        # event_date는 Iceberg 파티션 키라 이 필터는 파일 수준에서 걸러진다.
-        silver = spark.table(SILVER_TABLE).filter(
-            F.col("event_date").isin(
-                F.lit(prev_str).cast("date"), F.lit(date_str).cast("date")
-            )
+    # ── 1. Silver 읽기: D와 D-1 ──────────────────────────────
+    # event_date는 Iceberg 파티션 키라 이 필터는 파일 수준에서 걸러진다.
+    silver = spark.table(SILVER_TABLE).filter(
+        F.col("event_date").isin(
+            F.lit(prev_str).cast("date"), F.lit(date_str).cast("date")
         )
-        today_rows = silver.filter(F.col("event_date") == F.lit(date_str).cast("date")).count()
-        context_rows = silver.filter(F.col("event_date") == F.lit(prev_str).cast("date")).count()
-        print(f"GOLD_SOURCE: {date_str}={today_rows} rows, context {prev_str}={context_rows} rows")
+    )
+    today_rows = silver.filter(F.col("event_date") == F.lit(date_str).cast("date")).count()
+    context_rows = silver.filter(F.col("event_date") == F.lit(prev_str).cast("date")).count()
+    print(f"GOLD_SOURCE: {date_str}={today_rows} rows, context {prev_str}={context_rows} rows")
 
-        if today_rows == 0:
-            # Silver와 같은 이유로 마커를 쓰지 않는다 — "정말 없음"과 "읽기 실패"를
-            # 구분할 수 없고, 마커를 안 쓰는 쪽의 비용이 훨씬 싸다.
-            print(f"GOLD_EMPTY: {date_str} — 마커를 쓰지 않으므로 다음 실행에서 재시도된다")
-            return
+    if today_rows == 0:
+        # Silver와 같은 이유로 마커를 쓰지 않는다 — "정말 없음"과 "읽기 실패"를
+        # 구분할 수 없고, 마커를 안 쓰는 쪽의 비용이 훨씬 싸다.
+        print(f"GOLD_EMPTY: {date_str} — 마커를 쓰지 않으므로 다음 실행에서 재시도된다")
+        return
 
-        # ── 2. 위치 보고 단위로 줄이기 ───────────────────────────
-        positions = dedup_positions(silver).cache()
-        today = F.col("owner_date") == F.lit(date_str).cast("date")
-        pos_today = positions.filter(today)
-        n_pos_today = pos_today.count()
-        print(
-            f"GOLD_DEDUP: silver_rows={today_rows} positions={n_pos_today} "
-            f"stale_repeats_removed={today_rows - n_pos_today}"
-        )
+    # ── 2. 위치 보고 단위로 줄이기 ───────────────────────────
+    positions = dedup_positions(silver).cache()
+    today = F.col("owner_date") == F.lit(date_str).cast("date")
+    pos_today = positions.filter(today)
+    n_pos_today = pos_today.count()
+    print(
+        f"GOLD_DEDUP: silver_rows={today_rows} positions={n_pos_today} "
+        f"stale_repeats_removed={today_rows - n_pos_today}"
+    )
 
-        # ── 3. 궤적 (D-1을 맥락으로 계산한 뒤 D 소유 행만 남긴다) ──
-        trajectory = build_trajectory(positions).filter(today).cache()
-        n_traj = trajectory.count()
-        n_segments = trajectory.select("segment_id").distinct().count()
-        # 자정 이전에 시작해 D로 넘어온 구간 = D-1 읽기가 실제로 이어준 구간
-        n_cross = (
-            trajectory.filter(F.split("segment_id", "_").getItem(1).cast("long") < midnight_epoch)
-            .select("segment_id").distinct().count()
-        )
-        min_dt = trajectory.agg(F.min("dt_s")).first()[0]
-        print(
-            f"GOLD_TRAJECTORY: rows={n_traj} segments={n_segments} "
-            f"crossing_midnight={n_cross} min_dt_s={min_dt}"
-        )
+    # ── 3. 궤적 (D-1을 맥락으로 계산한 뒤 D 소유 행만 남긴다) ──
+    trajectory = build_trajectory(positions).filter(today).cache()
+    n_traj = trajectory.count()
+    n_segments = trajectory.select("segment_id").distinct().count()
+    # 자정 이전에 시작해 D로 넘어온 구간 = D-1 읽기가 실제로 이어준 구간
+    n_cross = (
+        trajectory.filter(F.split("segment_id", "_").getItem(1).cast("long") < midnight_epoch)
+        .select("segment_id").distinct().count()
+    )
+    min_dt = trajectory.agg(F.min("dt_s")).first()[0]
+    print(
+        f"GOLD_TRAJECTORY: rows={n_traj} segments={n_segments} "
+        f"crossing_midnight={n_cross} min_dt_s={min_dt}"
+    )
 
-        traj_out = trajectory.withColumnRenamed("owner_date", "event_date")
-        mode = write_partition(traj_out, GOLD_TRAJECTORY_TABLE, "event_date")
-        print(f"GOLD_WRITE: {mode} {GOLD_TRAJECTORY_TABLE} rows={n_traj}")
+    traj_out = trajectory.withColumnRenamed("owner_date", "event_date")
+    mode = write_partition(traj_out, GOLD_TRAJECTORY_TABLE, "event_date")
+    print(f"GOLD_WRITE: {mode} {GOLD_TRAJECTORY_TABLE} rows={n_traj}")
 
-        # ── 4. DA 집계 (지상 포함) ─────────────────────────────
-        daily = build_aircraft_daily(pos_today, trajectory).withColumn(
-            "event_date", F.lit(date_str).cast("date")
-        )
-        n_daily = daily.count()
-        mode = write_partition(daily, GOLD_AIRCRAFT_DAILY_TABLE, "event_date")
-        print(f"GOLD_WRITE: {mode} {GOLD_AIRCRAFT_DAILY_TABLE} rows={n_daily}")
+    # ── 4. DA 집계 (지상 포함) ─────────────────────────────
+    daily = build_aircraft_daily(pos_today, trajectory).withColumn(
+        "event_date", F.lit(date_str).cast("date")
+    )
+    n_daily = daily.count()
+    mode = write_partition(daily, GOLD_AIRCRAFT_DAILY_TABLE, "event_date")
+    print(f"GOLD_WRITE: {mode} {GOLD_AIRCRAFT_DAILY_TABLE} rows={n_daily}")
 
-        hourly = build_traffic_hourly(pos_today).withColumn(
-            "event_date", F.lit(date_str).cast("date")
-        )
-        n_hourly = hourly.count()
-        mode = write_partition(hourly, GOLD_TRAFFIC_HOURLY_TABLE, "event_date")
-        print(f"GOLD_WRITE: {mode} {GOLD_TRAFFIC_HOURLY_TABLE} rows={n_hourly}")
+    hourly = build_traffic_hourly(pos_today).withColumn(
+        "event_date", F.lit(date_str).cast("date")
+    )
+    n_hourly = hourly.count()
+    mode = write_partition(hourly, GOLD_TRAFFIC_HOURLY_TABLE, "event_date")
+    print(f"GOLD_WRITE: {mode} {GOLD_TRAFFIC_HOURLY_TABLE} rows={n_hourly}")
 
-        # ── 5. 마커 — 세 테이블 쓰기가 모두 끝난 뒤 ──────────────
-        # 세 커밋은 원자적이지 않다. 중간에 죽으면 마커가 없어 다음 실행에서 날짜
-        # 전체를 다시 하고, 세 쓰기 모두 overwritePartitions라 무해하다.
-        write_marker(
-            GOLD_MARKER_PREFIX, date_str, n_traj,
-            f"{GOLD_TRAJECTORY_TABLE},{GOLD_AIRCRAFT_DAILY_TABLE},{GOLD_TRAFFIC_HOURLY_TABLE}",
-        )
-        print(f"GOLD_DONE: date={date_str}")
-
-    finally:
-        spark.stop()
+    # ── 5. 마커 — 세 테이블 쓰기가 모두 끝난 뒤 ──────────────
+    # 세 커밋은 원자적이지 않다. 중간에 죽으면 마커가 없어 다음 실행에서 날짜
+    # 전체를 다시 하고, 세 쓰기 모두 overwritePartitions라 무해하다.
+    write_marker(
+        GOLD_MARKER_PREFIX, date_str, n_traj,
+        f"{GOLD_TRAJECTORY_TABLE},{GOLD_AIRCRAFT_DAILY_TABLE},{GOLD_TRAFFIC_HOURLY_TABLE}",
+    )
+    print(f"GOLD_DONE: date={date_str}")
 
 
 if __name__ == "__main__":

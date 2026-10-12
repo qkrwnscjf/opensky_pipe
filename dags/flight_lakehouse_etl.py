@@ -192,12 +192,22 @@ def _pending_merge():
     return pending
 
 
-def _spark_submit(script, date):
+def _spark_submit(script, dates):
     return (
         "/home/airflow/.local/bin/spark-submit "
         f"--packages {SPARK_PACKAGES} "
-        f"/opt/airflow/src/{script} --date {date}"
+        f"/opt/airflow/src/{script} --date {' '.join(dates)}"
     )
+
+
+# 1-27 (2026-10-12): 날짜마다 spark-submit을 하나씩 띄우던 것을 최대 DATES_PER_SUBMIT개씩 묶는다. 며칠치를
+# 따라잡을 때 JVM 기동·패키지 확인이 날짜 수만큼 반복되던 고정 비용이 묶음 수만큼으로 준다(하루치는 그대로 1번).
+# 상한을 두는 이유: 한 태스크가 execution_timeout(45분) 안에 끝나야 하고, 재시도하면 묶음 전체를 다시 하기 때문.
+DATES_PER_SUBMIT = int(os.getenv("ETL_DATES_PER_SUBMIT", "10"))
+
+
+def _batched_commands(script, dates):
+    return [_spark_submit(script, dates[i:i + DATES_PER_SUBMIT]) for i in range(0, len(dates), DATES_PER_SUBMIT)]
 
 
 with DAG(
@@ -237,11 +247,11 @@ with DAG(
     # JVM을 띄우지 않기 위해서다. 반환이 빈 리스트면 매핑 태스크는 인스턴스 0개로 skip된다.
     @task
     def build_silver_commands() -> list:
-        return [_spark_submit("spark_batch_etl.py", d) for d in _pending(MARKER_PREFIX, "silver")]
+        return _batched_commands("spark_batch_etl.py", _pending(MARKER_PREFIX, "silver"))
 
     @task
     def build_gold_commands() -> list:
-        return [_spark_submit("spark_gold_etl.py", d) for d in _pending(GOLD_MARKER_PREFIX, "gold")]
+        return _batched_commands("spark_gold_etl.py", _pending(GOLD_MARKER_PREFIX, "gold"))
 
     # 날짜 하나당 태스크 하나(동적 태스크 매핑). 한 잡이 여러 날짜를 처리하지
     # 않게 쪼개는 이유: 3일치 중 2일차에서 실패해도 1일차의 마커는 이미 남아
@@ -282,7 +292,7 @@ with DAG(
     # 실패했어도 병합해도 되는 날짜만 처리된다.
     @task(trigger_rule="all_done")
     def build_merge_commands() -> list:
-        return [_spark_submit("bronze_merge.py", d) for d in _pending_merge()]
+        return _batched_commands("bronze_merge.py", _pending_merge())
 
     merge_commands = build_merge_commands()
     run_merge = BashOperator.partial(

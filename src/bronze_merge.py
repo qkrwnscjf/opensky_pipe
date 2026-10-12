@@ -151,13 +151,41 @@ def finish(client, date_str, manifest, stage_root):
 
 
 def main():
+    # 1-27 (2026-10-12): 날짜 여러 개를 한 번에. Spark는 실제로 병합할 날짜가 나올 때 처음 한 번만 띄우고
+    # (파일이 1개 이하인 날짜는 Spark 없이 끝난다) 모든 날짜가 끝난 뒤 멈춘다. 실패 처리는 Silver·Gold와 같다.
     parser = argparse.ArgumentParser(description="Bronze 일별 파일 병합")
-    parser.add_argument("--date", required=True, help="병합할 날짜 (YYYY-MM-DD)")
+    parser.add_argument("--date", required=True, nargs="+", help="병합할 날짜 (YYYY-MM-DD), 여러 개 가능")
     args = parser.parse_args()
-    validate_date(args.date)
+    dates = sorted(set(args.date))
+    for d in dates:
+        validate_date(d)
 
-    date_str = args.date
     client = s3_client()
+    holder = {}
+
+    def get_spark():
+        if "spark" not in holder:
+            holder["spark"] = build_spark(f"bronze_merge_{dates[0]}" + (f"..{dates[-1]}" if len(dates) > 1 else ""))
+            holder["spark"].sparkContext.setLogLevel("WARN")
+        return holder["spark"]
+
+    failed = []
+    try:
+        for date_str in dates:
+            try:
+                run_date(client, get_spark, date_str)
+            except Exception as e:
+                failed.append(date_str)
+                print(f"MERGE_DATE_FAILED: date={date_str} ({str(e).splitlines()[0][:200] if str(e) else type(e).__name__})")
+    finally:
+        if "spark" in holder:
+            holder["spark"].stop()
+    print(f"MERGE_BATCH_DONE: dates={len(dates)} failed={failed}")
+    if failed:
+        sys.exit(1)
+
+
+def run_date(client, get_spark, date_str):
     live_prefix = f"{BRONZE_PREFIX}/dt={date_str}/"
     stage_root = f"{STAGING_PREFIX}/{date_str}/"
     manifest_key = stage_root + "manifest.json"
@@ -192,43 +220,39 @@ def main():
     n_files = max(1, math.ceil(in_bytes / TARGET_FILE_BYTES))
     print(f"MERGE_PLAN: files={len(originals)} bytes={in_bytes} -> target_files={n_files}")
 
-    spark = build_spark(f"bronze_merge_{date_str}")
-    spark.sparkContext.setLogLevel("WARN")
-    try:
-        # ── 2. 목록의 파일만 읽기 ─────────────────────────────
-        # 디렉터리가 아니라 파일을 하나하나 지정한다(불변 조건 2).
-        src = spark.read.parquet(*[s3a(o["Key"]) for o in originals])
-        # 파일 안에는 dt가 없다(경로에만 있음). 경로 추론으로 생기더라도 빼서 양쪽을 맞춘다.
-        cols = [c for c in src.columns if c != "dt"]
-        n_in, h_in = fingerprint(src, cols)
-        print(f"MERGE_READ: rows={n_in} hash={h_in}")
+    spark = get_spark()
+    # ── 2. 목록의 파일만 읽기 ─────────────────────────────
+    # 디렉터리가 아니라 파일을 하나하나 지정한다(불변 조건 2).
+    src = spark.read.parquet(*[s3a(o["Key"]) for o in originals])
+    # 파일 안에는 dt가 없다(경로에만 있음). 경로 추론으로 생기더라도 빼서 양쪽을 맞춘다.
+    cols = [c for c in src.columns if c != "dt"]
+    n_in, h_in = fingerprint(src, cols)
+    print(f"MERGE_READ: rows={n_in} hash={h_in}")
 
-        # ── 3. 임시 경로에 병합본 쓰기 ──────────────────────────
-        # repartitionByRange → 파일끼리도 (icao24, timestamp) 범위로 나뉘고,
-        # sortWithinPartitions → 파일 안도 정렬된다. n_files=1이면 전체 정렬.
-        run_id = uuid.uuid4().hex[:8]
-        stage_data = f"{stage_root}run_{run_id}/"
-        (
-            src.select(cols)
-            .repartitionByRange(n_files, "icao24", "timestamp")
-            .sortWithinPartitions("icao24", "timestamp")
-            .write.mode("overwrite")
-            .option("compression", "snappy")
-            .parquet(s3a(stage_data))
-        )
+    # ── 3. 임시 경로에 병합본 쓰기 ──────────────────────────
+    # repartitionByRange → 파일끼리도 (icao24, timestamp) 범위로 나뉘고,
+    # sortWithinPartitions → 파일 안도 정렬된다. n_files=1이면 전체 정렬.
+    run_id = uuid.uuid4().hex[:8]
+    stage_data = f"{stage_root}run_{run_id}/"
+    (
+        src.select(cols)
+        .repartitionByRange(n_files, "icao24", "timestamp")
+        .sortWithinPartitions("icao24", "timestamp")
+        .write.mode("overwrite")
+        .option("compression", "snappy")
+        .parquet(s3a(stage_data))
+    )
 
-        # ── 4. 검증 ────────────────────────────────────────────
-        staged = list_parquet(client, stage_data)
-        merged_df = spark.read.parquet(*[s3a(o["Key"]) for o in staged])
-        n_out, h_out = fingerprint(merged_df, cols)
-        if (n_in, h_in) != (n_out, h_out):
-            delete_prefix(client, stage_root)
-            print(f"MERGE_VERIFY_FAILED: in=({n_in},{h_in}) out=({n_out},{h_out}) — 원본은 그대로 둔다")
-            sys.exit(1)
-        out_bytes = sum(o["Size"] for o in staged)
-        print(f"MERGE_VERIFIED: rows={n_out} hash match, files={len(staged)} bytes={out_bytes}")
-    finally:
-        spark.stop()
+    # ── 4. 검증 ────────────────────────────────────────────
+    staged = list_parquet(client, stage_data)
+    merged_df = spark.read.parquet(*[s3a(o["Key"]) for o in staged])
+    n_out, h_out = fingerprint(merged_df, cols)
+    if (n_in, h_in) != (n_out, h_out):
+        delete_prefix(client, stage_root)
+        print(f"MERGE_VERIFY_FAILED: in=({n_in},{h_in}) out=({n_out},{h_out}) — 원본은 그대로 둔다")
+        raise RuntimeError("merge verification failed")
+    out_bytes = sum(o["Size"] for o in staged)
+    print(f"MERGE_VERIFIED: rows={n_out} hash match, files={len(staged)} bytes={out_bytes}")
 
     # ── 5. manifest — 원본을 건드리기 전에 "무엇을 지울지"를 먼저 남긴다 ──
     merged = [
