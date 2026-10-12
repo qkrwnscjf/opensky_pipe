@@ -377,9 +377,9 @@ services:
   # 이 Airflow가 하는 일은 하나뿐이다: dags/flight_lakehouse_etl.py를 하루 한 번
   # 돌려 아직 처리되지 않은 날짜마다 spark_batch_etl.py를 spark-submit 한다.
   #
-  # 【보안】 admin/admin 하드코딩, 메타DB 기본 비밀번호, 8080·5433 포트 노출이
-  # 그대로다. 제거 이전 형태를 의도적으로 그대로 되살린 것이며, 작업 순서 6번
-  # (보안)에서 다른 항목들과 함께 한 번에 처리한다.
+  # 【보안】 admin/admin 하드코딩, 메타DB 기본 비밀번호, 5433 포트 노출이 그대로다 — 작업 순서 6번
+  # (보안)에서 다른 항목들과 함께 처리한다. 8080은 1-26(2026-10-12)으로 웹서버를 분리하면서 평소엔 닫혔고,
+  # UI를 켤 때만 127.0.0.1에 열린다.
   airflow:
     build: .
     container_name: airflow
@@ -397,10 +397,28 @@ services:
       airflow db migrate
       echo 'Creating admin user...'
       airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@example.com --password admin || true
-      echo 'Starting scheduler and webserver...'
-      airflow scheduler &
-      exec airflow webserver
+      echo 'Starting scheduler (webserver: profile airflow-ui)...'
+      while true; do airflow scheduler; echo 'SCHEDULER_EXITED: restarting in 5s'; sleep 5; done
       "
+    # 1-26 (2026-10-12, 사용자 결정): 웹서버는 자동화에 필요 없어 별도 서비스 airflow-webserver(profile
+    # airflow-ui)로 분리 — 평소엔 scheduler만 돈다. 그래서 이 서비스는 포트를 열지 않는다(8080 미공개).
+    # hostname 고정: 태스크 로그는 이 컨테이너에 남고, 웹서버는 태스크에 기록된 hostname의 8793(scheduler의
+    # 로그 서버, 내부망 전용)으로 가져온다. 컨테이너 ID 대신 'airflow'로 기록돼야 웹서버가 찾아간다.
+    hostname: airflow
+    # 1-24 (2026-10-12): scheduler는 백그라운드라 죽어도 컨테이너(=webserver)는 정상으로 보였다 → DAG가 조용히
+    # 영영 안 돎(실측: scheduler 강제 종료 후 heartbeat 100초 끊김, 컨테이너는 'Up' 그대로). 위 루프가 종료된
+    # scheduler를 5초 뒤 다시 띄우고, 아래 헬스체크가 메타데이터 DB의 scheduler heartbeat(5초마다 갱신)가
+    # 60초 넘게 끊기면 unhealthy로 표시한다(죽지 않고 멈춘 경우 — 루프가 못 잡는 경우). 표시만, 재시작은 안 함.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,psycopg2; c=psycopg2.connect('postgresql://airflow:airflow@airflow-postgres/airflow'); cur=c.cursor(); cur.execute(\"select extract(epoch from now()-max(latest_heartbeat)) from job where job_type='SchedulerJob' and state='running'\"); a=cur.fetchone()[0]; sys.exit(0 if a is not None and a < 60 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 2
+      start_period: 180s
     environment:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -412,8 +430,9 @@ services:
       # ① 웹서버 작업자 4→2: 기동 때 한꺼번에 뜨는 프로세스를 줄인다(UI는 혼자 가끔 보는 용도).
       # ② 기동 대기 120→300초: 실패 원인(시간 초과) 자체에 여유를 준다.
       # ③ 아래 restart 정책: 그래도 죽으면 다시 뜬다(안전망).
-      - AIRFLOW__WEBSERVER__WORKERS=2
-      - AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT=300
+      # (1-26 이후 웹서버는 airflow-webserver 서비스에서 돈다 — 위 두 값도 그쪽으로 옮김)
+      # 로그 서버(8793) 요청 서명 키 — 웹서버와 같은 값이어야 태스크 로그를 가져올 수 있다(보안 6-3에서 재검토).
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_WEBSERVER_SECRET_KEY:-skystream-local-only}
       - AIRFLOW_VAR_MINIO_ENDPOINT=http://minio:9000
       - AIRFLOW_VAR_KAFKA_BOOTSTRAP_SERVERS=kafka:29092
       # DAG(boto3)와 배치 ETL(boto3 + s3a)이 둘 다 평범한 환경변수로 읽는다.
@@ -428,8 +447,6 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:-mypassword}
       - DB_NAME=${DB_NAME:-flightdb}
       - DB_HOST=postgres
-    ports:
-      - "8080:8080"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./src:/opt/airflow/src
@@ -438,6 +455,41 @@ services:
       - airflow-postgres
       - kafka
       - minio
+
+  # 9-1. Airflow 웹 UI — 필요할 때만 (1-26, 2026-10-12, 사용자 결정)
+  #
+  # 평소엔 꺼져 있다: `docker compose --profile airflow-ui up -d airflow-webserver`로 켜고, 다 보면
+  # `docker compose stop airflow-webserver`. 메모리를 상주로 쓰지 않고, 기동 때 Spark 배치와 겹쳐 gunicorn이
+  # 시간 초과로 죽던 문제(10-06)도 구조적으로 사라진다. 포트는 127.0.0.1에만 연다 — mlflow-ui와 같은 방식이고,
+  # 예전처럼 모든 네트워크에 admin/admin을 여는 것보다 좁다. DB 초기화·계정 생성은 airflow 서비스가 하므로
+  # 여기서는 마이그레이션이 끝났는지만 기다린다.
+  airflow-webserver:
+    build: .
+    container_name: airflow-webserver
+    profiles: ["airflow-ui"]
+    restart: "no"
+    command: |
+      bash -c "
+      until python -c 'import socket; s = socket.socket(); s.connect((\"airflow-postgres\", 5432))' 2>/dev/null; do
+        sleep 1
+      done
+      airflow db check-migrations -t 300
+      exec airflow webserver
+      "
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      # 시작 안정화(10-06): 작업자 4→2, 기동 대기 120→300초 — 웹서버와 함께 이쪽으로 옮김
+      - AIRFLOW__WEBSERVER__WORKERS=2
+      - AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT=300
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_WEBSERVER_SECRET_KEY:-skystream-local-only}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+    depends_on:
+      - airflow
 
   # Airflow 전용 메타데이터 DB
   #
