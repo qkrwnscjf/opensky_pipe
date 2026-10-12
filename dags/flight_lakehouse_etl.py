@@ -1,10 +1,10 @@
 """Bronze → Silver → Gold 배치 ETL의 스케줄러. docs/TASK_ORDER.md 0-6 구현.
 
-  build_silver_commands → run_silver_for_date (날짜별, Bronze → Silver)
-                                   ↓ (전부 끝난 뒤)
-  build_gold_commands   → run_gold_for_date   (날짜별, Silver → Gold)
+  build_silver_commands → run_silver_for_date (최대 10일 묶음, Bronze → Silver)
+                                   ↓ (성공·실패와 무관하게 전부 끝난 뒤)
+  build_gold_commands   → run_gold_for_date   (Silver D·D-1이 끝난 날짜만, 최대 10일 묶음, Silver → Gold)
                                    ↓ (결과와 무관하게 끝난 뒤)
-  build_merge_commands  → run_bronze_merge_for_date (날짜별, Bronze 파일 병합)
+  build_merge_commands  → run_bronze_merge_for_date (Silver가 끝난 날짜, 최대 10일 묶음, Bronze 파일 병합)
 
 단계마다 마커를 따로 둔다(etl_markers/, etl_markers_gold/, etl_markers_bronze_merge/).
 그래서 한 단계만 실패한 날짜도 다음 실행에서 그 단계만 따라잡는다.
@@ -172,6 +172,43 @@ def _pending(marker_prefix, label):
     return pending
 
 
+def _gold_eligible(bronze, silver_done, gold_done, today):
+    """R-2 (2026-10-12): Gold로 보낼 날짜와 보류할 날짜를 가른다 — 순수 함수(테스트용으로 분리).
+
+    Gold D는 Silver D와 Silver D-1(전날 맥락)을 읽는다. 그래서 날짜마다 "그 둘이 준비됐는가"만 보면 되고,
+    다른 날짜의 Silver 실패와는 무관하다. 예전에는 Silver 태스크가 하나라도 실패하면 trigger_rule
+    none_failed로 **모든 날짜의 Gold**를 건너뛰었다 — 깨진 파티션 하나(1-11 날짜 검사 실패 등)가 고쳐질
+    때까지 Gold 전체가 무기한 멈췄다. Gold D-1은 읽지 않으므로 처리 순서는 결과에 영향이 없다.
+
+    준비 조건: Silver D 완료 마커가 있고, D-1이 Bronze에 있다면 Silver D-1 완료 마커도 있을 것.
+    (D-1이 Bronze에 아예 없으면 — 스택이 꺼져 있던 날 — 읽을 맥락이 없는 것이 정상이라 기다리지 않는다.)
+    """
+    ready, held = [], []
+    for d in sorted(x for x in (bronze - gold_done) if x < today):
+        prev = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        if d not in silver_done:
+            held.append((d, "silver_missing"))
+        elif prev in bronze and prev not in silver_done:
+            held.append((d, f"context_silver_missing:{prev}"))
+        else:
+            ready.append(d)
+    return ready, held
+
+
+def _pending_gold():
+    client = _s3()
+    bronze = _dates_under(client, BRONZE_PREFIX)
+    ready, held = _gold_eligible(
+        bronze,
+        _completed_dates(client, MARKER_PREFIX),
+        _completed_dates(client, GOLD_MARKER_PREFIX),
+        datetime.utcnow().strftime("%Y-%m-%d"),
+    )
+    print(f"[gold] READY_DATES: {ready}")
+    print(f"[gold] HELD_DATES: {held}")
+    return ready
+
+
 def _pending_merge():
     """병합 대상 = Silver 마커가 있는 날짜 − 병합 마커가 있는 날짜 − 오늘.
 
@@ -249,13 +286,14 @@ with DAG(
     def build_silver_commands() -> list:
         return _batched_commands("spark_batch_etl.py", _pending(MARKER_PREFIX, "silver"))
 
-    @task
+    # Gold 대상은 Silver가 **모두 끝난 뒤**(성공·실패 무관, all_done) 마커를 보고 정한다 — 이번 실행에서 막 끝난
+    # Silver 날짜도 포함되고, 실패한 날짜(와 그 다음 날)만 보류된다(R-2, _gold_eligible 참고).
+    @task(trigger_rule="all_done")
     def build_gold_commands() -> list:
-        return _batched_commands("spark_gold_etl.py", _pending(GOLD_MARKER_PREFIX, "gold"))
+        return _batched_commands("spark_gold_etl.py", _pending_gold())
 
-    # 날짜 하나당 태스크 하나(동적 태스크 매핑). 한 잡이 여러 날짜를 처리하지
-    # 않게 쪼개는 이유: 3일치 중 2일차에서 실패해도 1일차의 마커는 이미 남아
-    # 재실행 때 다시 하지 않는다. 실패의 영향 범위가 하루로 갇힌다.
+    # 날짜 묶음당 태스크 하나(동적 태스크 매핑, 1-27로 최대 DATES_PER_SUBMIT일씩). 묶음 안에서 한 날짜가 실패해도
+    # 나머지 날짜의 마커는 남아 재실행 때 다시 하지 않는다.
     #
     # max_active_tis_per_dag=1: 밀린 날짜가 여러 개여도 Spark 드라이버는 한 번에
     # 하나만 뜬다. 로컬 메모리 한계(spark 서비스 mem_limit 2g와 같은 호스트)와
@@ -265,20 +303,15 @@ with DAG(
         max_active_tis_per_dag=1,
     ).expand(bash_command=build_silver_commands())
 
-    # Gold는 **모든** Silver 태스크가 끝난 뒤에 돈다. 날짜 D의 Gold가 D-1의 Silver를
-    # 맥락으로 읽기 때문에, 날짜별로 Silver→Gold를 번갈아 돌리는 것보다 Silver를 먼저
-    # 다 채우는 편이 정확하다.
-    #
-    # trigger_rule="none_failed": Silver가 이미 다 끝나 있으면 run_silver는 인스턴스
-    # 0개로 skipped가 된다. 기본값(all_success)이면 그때 Gold까지 skip되어, "Silver는
-    # 됐는데 Gold가 실패한 날짜"를 영영 따라잡지 못한다. none_failed는 skipped는
-    # 통과시키고, Silver가 하나라도 실패하면 Gold를 막는다 — Silver가 불완전한 채로
-    # Gold를 만들지 않는다.
+    # Gold는 **모든** Silver 태스크가 끝난 뒤에 돈다(날짜 D의 Gold가 D-1의 Silver를 맥락으로 읽으므로 Silver를
+    # 먼저 다 채운다). 정합성은 날짜 단위로 지킨다: 대상 목록(build_gold_commands)이 "Silver D·D-1 완료" 날짜만
+    # 담으므로, 여기서는 그 목록만 기다리면 된다(기본 all_success). 목록이 비면 인스턴스 0개로 skipped.
+    # 예전의 trigger_rule="none_failed"는 Silver 실패 하나로 전 날짜의 Gold를 막았다(R-2).
+    gold_commands = build_gold_commands()
     run_gold = BashOperator.partial(
         task_id="run_gold_for_date",
         max_active_tis_per_dag=1,
-        trigger_rule="none_failed",
-    ).expand(bash_command=build_gold_commands())
+    ).expand(bash_command=gold_commands)
 
     # Bronze 병합. Gold 뒤에 한 줄로 잇는 이유: max_active_tis_per_dag=1은 **태스크
     # 하나 단위** 제한이라, 병합을 Silver 바로 뒤에 두면 Gold와 동시에 돌아 Spark가
@@ -300,4 +333,5 @@ with DAG(
         max_active_tis_per_dag=1,
     ).expand(bash_command=merge_commands)
 
-    run_silver >> run_gold >> merge_commands
+    run_silver >> gold_commands
+    run_gold >> merge_commands
