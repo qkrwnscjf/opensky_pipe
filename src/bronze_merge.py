@@ -52,13 +52,15 @@ import uuid
 from botocore.exceptions import ClientError
 from pyspark.sql import functions as F
 
-from lakehouse_common import LAKE_BUCKET, build_spark, s3_client, validate_date, write_marker, write_run_record
+from lakehouse_common import (LAKE_BUCKET, build_spark, s3_client, stage_code_version, validate_date, write_marker,
+                              write_run_record)
 
 # DAG의 BRONZE_PREFIX와 같은 값이어야 한다. boto3는 접두사, Spark는 s3a:// 경로로 쓴다.
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "positions")
 # 임시 작업 공간. positions/ 밖에 둬야 Silver가 절대 읽지 않는다.
 STAGING_PREFIX = os.getenv("BRONZE_MERGE_STAGING", "bronze_merge_staging")
 MERGE_MARKER_PREFIX = os.getenv("BRONZE_MERGE_MARKER_PREFIX", "etl_markers_bronze_merge")
+CODE_VERSION = stage_code_version("merge")  # 1-16
 
 # 병합본 파일 하나의 **최대** 크기. 하루에 쌓이는 양이 아니다.
 # 하루치가 이보다 작으면 파일 1개, 크면 여러 개로 나눈다. 지금 규모(하루 ~1MB, 24시간
@@ -143,6 +145,7 @@ def finish(client, date_str, manifest, stage_root):
         MERGE_MARKER_PREFIX, date_str, manifest["rows"],
         f"{len(manifest['originals'])} files/{manifest['in_bytes']}B -> "
         f"{len(manifest['merged'])} files/{manifest['out_bytes']}B",
+        code_version=CODE_VERSION,
     )
     print(
         f"MERGE_DONE: date={date_str} files {len(manifest['originals'])} -> "
@@ -176,7 +179,7 @@ def main():
             started = time.time()
             try:
                 result = run_date(client, get_spark, date_str) or {}
-                write_run_record("bronze_merge", date_str, dict(result, duration_s=round(time.time() - started, 1)))
+                write_run_record("bronze_merge", date_str, dict(result, duration_s=round(time.time() - started, 1), code_version=CODE_VERSION))
             except Exception as e:
                 failed.append(date_str)
                 reason = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
@@ -219,7 +222,7 @@ def run_date(client, get_spark, date_str):
     if len(originals) <= 1:
         # 이미 1개 이하 — 할 일이 없다. 이전에 병합이 끝났거나 원래 파일이 하나다.
         # 행 수는 세지 않는다(Spark를 띄울 이유가 없음) — 마커의 rows=-1은 "안 셈"이다.
-        write_marker(MERGE_MARKER_PREFIX, date_str, -1, f"{len(originals)} file(s), nothing to merge")
+        write_marker(MERGE_MARKER_PREFIX, date_str, -1, f"{len(originals)} file(s), nothing to merge", code_version=CODE_VERSION)
         print(f"MERGE_SKIP: date={date_str} files={len(originals)}")
         return {"status": "skip", "files": len(originals)}
     in_bytes = sum(o["Size"] for o in originals)

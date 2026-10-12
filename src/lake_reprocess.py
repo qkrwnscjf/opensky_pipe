@@ -8,10 +8,11 @@ etl_markers_bronze_merge/), Silver를 다시 하면 Gold D와 D+1(다음 날 Gol
     python src/lake_reprocess.py --stage silver --date 2026-10-03 --cascade          # 미리보기(기본)
     python src/lake_reprocess.py --stage silver --date 2026-10-03 --cascade --apply  # 실제로 지움
     python src/lake_reprocess.py --late-check --date 2026-10-03                     # 늦은 파일 찾기
+    python src/lake_reprocess.py --stale --stage gold                               # 옛 코드로 처리된 날짜 (1-16)
 
 안전장치:
   - 기본은 미리보기. --apply가 있어야 지운다.
-  - 내용이 EXCLUDED로 시작하는 마커(사용자가 일부러 처리에서 뺀 날짜, 예: 2026-09-22)는 --force 없이는 지우지 않는다.
+  - `status=EXCLUDED…` 줄이 있는 마커(사용자가 일부러 처리에서 뺀 날짜, 예: 2026-09-22)는 --force 없이는 지우지 않는다.
   - Spark를 띄우지 않는다(boto3만). DAG 실행 중에 지워도 그 실행은 이미 날짜 목록을 정했으므로 다음 실행부터 반영된다.
 
 늦은 파일 판정: positions/dt=D/ 아래 데이터 파일 중 Silver 마커보다 나중에 생긴 것. 병합 파일(merged-*)은 Silver 마커
@@ -21,7 +22,7 @@ import argparse
 import os
 from datetime import datetime, timedelta
 
-from lakehouse_common import LAKE_BUCKET, s3_client, validate_date
+from lakehouse_common import LAKE_BUCKET, s3_client, stage_code_version, validate_date
 
 PREFIXES = {
     "silver": os.getenv("ETL_MARKER_PREFIX", "etl_markers"),
@@ -30,6 +31,12 @@ PREFIXES = {
 }
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "positions")
 MERGED_NAME_PREFIX = "merged-"
+
+
+def is_excluded(body):
+    """일부러 처리에서 뺀 날짜의 마커인가. 실제 형식은 `status=EXCLUDED (not processed)` 줄이다(2026-09-30 작성).
+    처음 구현은 본문이 'EXCLUDED'로 시작하는지만 봐서 이 마커를 보호하지 못했다(1-16 점검 중 발견, 10-12)."""
+    return any(line.startswith("status=EXCLUDED") or line.startswith("EXCLUDED") for line in body.splitlines())
 
 
 def marker_key(stage, date_str):
@@ -71,7 +78,7 @@ def reprocess(client, targets, apply, force):
             print(f"REPROCESS_ABSENT: {stage} {d} (마커 없음 — 이미 다음 실행 대상)")
             continue
         body = client.get_object(Bucket=LAKE_BUCKET, Key=key)["Body"].read().decode("utf-8", "replace")
-        if body.startswith("EXCLUDED") and not force:
+        if is_excluded(body) and not force:
             print(f"REPROCESS_PROTECTED: {stage} {d} (EXCLUDED 마커 — 지우려면 --force)")
             continue
         if apply:
@@ -103,21 +110,65 @@ def late_check(client, dates):
             print(f"  LATE_FILE: {leaf}")
 
 
+def marker_dates(client, stage):
+    dates = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=f"{PREFIXES[stage]}/"):
+        for obj in page.get("Contents", []):
+            parts = obj["Key"].split("/")
+            if parts[-1] == "_SUCCESS" and parts[-2].startswith("dt="):
+                dates.append(parts[-2][len("dt="):])
+    return sorted(dates)
+
+
+def stale(client, stages, dates):
+    """1-16: 마커의 code_version이 지금 코드와 다른 날짜(없으면 'unknown' — 1-16 이전에 처리됨). 지우지 않고 보여 주기만
+    한다. EXCLUDED 마커는 일부러 뺀 날짜라 목록에서 따로 표시한다. 다시 처리하려면 --stage … --date … --apply."""
+    for stage in stages:
+        current = stage_code_version(stage)
+        found = dates or marker_dates(client, stage)
+        stale_dates, unknown, excluded = [], [], []
+        for d in found:
+            meta = head(client, marker_key(stage, d))
+            if meta is None:
+                continue
+            body = client.get_object(Bucket=LAKE_BUCKET, Key=marker_key(stage, d))["Body"].read().decode("utf-8", "replace")
+            if is_excluded(body):
+                excluded.append(d)
+                continue
+            version = next((line.split("=", 1)[1] for line in body.splitlines() if line.startswith("code_version=")), None)
+            if version is None:
+                unknown.append(d)
+            elif version != current:
+                stale_dates.append(d)
+        print(f"STALE_CHECK: {stage} current={current} markers={len(found)} stale={len(stale_dates)} "
+              f"unknown={len(unknown)} excluded={len(excluded)}")
+        for label, items in (("STALE", stale_dates), ("UNKNOWN", unknown)):
+            if items:
+                print(f"  {label}_DATES: {' '.join(items)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="레이크하우스 재처리 도우미 (마커 삭제 / 늦은 파일 점검)")
-    parser.add_argument("--date", required=True, nargs="+", help="날짜 (YYYY-MM-DD), 여러 개 가능")
+    parser.add_argument("--date", nargs="*", default=[], help="날짜 (YYYY-MM-DD), 여러 개 가능 (--stale은 생략 시 전체)")
     parser.add_argument("--stage", nargs="+", choices=sorted(PREFIXES), help="마커를 지울 단계")
     parser.add_argument("--cascade", action="store_true", help="Silver를 지우면 Gold D·D+1도 함께")
     parser.add_argument("--apply", action="store_true", help="실제로 지운다(없으면 미리보기)")
     parser.add_argument("--force", action="store_true", help="EXCLUDED 마커도 지운다")
     parser.add_argument("--late-check", action="store_true", help="Silver 마커 뒤에 들어온 Bronze 파일 찾기")
+    parser.add_argument("--stale", action="store_true", help="지금 코드와 다른 버전으로 처리된 날짜 보기 (지우지 않음)")
     args = parser.parse_args()
     for d in args.date:
         validate_date(d)
-    if not args.stage and not args.late_check:
-        parser.error("--stage 또는 --late-check 중 하나는 필요하다")
+    if not args.stage and not args.late_check and not args.stale:
+        parser.error("--stage, --late-check, --stale 중 하나는 필요하다")
+    if not args.date and not args.stale:
+        parser.error("--date가 필요하다(--stale만 생략 가능)")
 
     client = s3_client()
+    if args.stale:
+        stale(client, args.stage or sorted(PREFIXES), sorted(set(args.date)))
+        return
     if args.late_check:
         late_check(client, sorted(set(args.date)))
     if args.stage:

@@ -96,7 +96,29 @@ def write_partition(df, table, partition_col):
     return "create"
 
 
-def write_marker(marker_prefix, date_str, rows, target):
+# 1-16 (2026-10-12): 완료 마커와 실행 기록에 "어떤 코드로 처리했는가"를 남긴다. 예전에는 로직을 바꿔도(예: 1-9 편명
+# 규칙, 1-10 이상치 컬럼) 어느 날짜가 옛 로직으로 계산됐는지 알 방법이 없었다. 버전은 그 단계 스크립트와 이 공용
+# 모듈의 내용 해시다 — 컨테이너에 .git이 없어 커밋 해시를 쓸 수 없고, 내용이 같으면 같은 값이라 재현된다.
+# 주석만 바뀌어도 값이 바뀌는 보수적인 기준이다(목록에 더 많이 뜰 뿐, 지우는 건 사람이 정한다 — lake_reprocess.py --stale).
+STAGE_SOURCES = {
+    "silver": ["spark_batch_etl.py"],
+    "gold": ["spark_gold_etl.py"],
+    "merge": ["bronze_merge.py"],
+}
+
+
+def stage_code_version(stage):
+    import hashlib
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    digest = hashlib.sha256()
+    for name in sorted(STAGE_SOURCES[stage] + ["lakehouse_common.py"]):
+        with open(os.path.join(base, name), "rb") as f:
+            digest.update(name.encode() + b"\0" + f.read())
+    return digest.hexdigest()[:12]
+
+
+def write_marker(marker_prefix, date_str, rows, target, code_version=None):
     """`<marker_prefix>/dt=<날짜>/_SUCCESS`를 남긴다.
 
     반드시 쓰기 성공 **뒤에** 호출한다. 반대 순서면 실패한 날짜가 완료로 찍혀 영영
@@ -111,6 +133,8 @@ def write_marker(marker_prefix, date_str, rows, target):
         f"target={target}\n"
         f"completed_at={datetime.utcnow().isoformat()}Z\n"
     )
+    if code_version:
+        body += f"code_version={code_version}\n"
     s3_client().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body.encode("utf-8"))
     print(f"ETL_MARKER_WRITTEN: s3://{LAKE_BUCKET}/{key}")
 

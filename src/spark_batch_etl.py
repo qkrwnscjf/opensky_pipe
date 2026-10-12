@@ -32,7 +32,10 @@ import time
 from pyspark.sql import functions as F
 from pyspark.sql.functions import lit
 
-from lakehouse_common import build_spark, validate_date, write_marker, write_partition, write_quality, write_run_record
+from lakehouse_common import (build_spark, stage_code_version, validate_date, write_marker, write_partition,
+                              write_quality, write_run_record)
+
+CODE_VERSION = stage_code_version("silver")  # 1-16
 
 # ---------------------------------------------------------------
 # 설정
@@ -67,7 +70,7 @@ def main():
             started = time.time()
             try:
                 result = run_date(spark, date_str) or {}
-                write_run_record("silver", date_str, dict(result, duration_s=round(time.time() - started, 1)))
+                write_run_record("silver", date_str, dict(result, duration_s=round(time.time() - started, 1), code_version=CODE_VERSION))
             except Exception as e:
                 failed.append(date_str)
                 reason = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
@@ -162,7 +165,7 @@ def run_date(spark, date_str):
 
     # ── 5. 마커 ─────────────────────────────────────────────
     # 반드시 쓰기 성공 뒤. 위에서 예외가 나면 여기 도달하지 않는다.
-    write_marker(MARKER_PREFIX, date_str, dedup_count, SILVER_TABLE)
+    write_marker(MARKER_PREFIX, date_str, dedup_count, SILVER_TABLE, code_version=CODE_VERSION)
     print(f"ETL_DONE: date={date_str} rows={dedup_count}")
     return {"status": "success", "rows": dedup_count, "raw_rows": raw_count}
 

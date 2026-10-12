@@ -61,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 
-from lakehouse_common import build_spark, validate_date, write_marker, write_partition, write_run_record
+from lakehouse_common import build_spark, stage_code_version, validate_date, write_marker, write_partition, write_run_record
 
 SILVER_TABLE = os.getenv("SILVER_TABLE", "lake.db.flight_features")
 GOLD_TRAJECTORY_TABLE = os.getenv("GOLD_TRAJECTORY_TABLE", "lake.db.gold_flight_trajectory")
@@ -71,6 +71,7 @@ GOLD_TRAFFIC_HOURLY_TABLE = os.getenv("GOLD_TRAFFIC_HOURLY_TABLE", "lake.db.gold
 # Silver 마커(etl_markers/)와 겹치지 않게 따로 둔다. Silver만 끝나고 Gold가 실패한
 # 날짜도 다음 실행에서 Gold만 따라잡을 수 있어야 하기 때문이다.
 GOLD_MARKER_PREFIX = os.getenv("GOLD_MARKER_PREFIX", "etl_markers_gold")
+CODE_VERSION = stage_code_version("gold")  # 1-16
 
 # 1-10 (2026-10-12): 궤적 이상치 표시 기준. 두 연속 보고 사이 계산 속도가 이보다 빠르면 is_outlier=true.
 # 지우지 않고 표시만 한다 — 학습·분석하는 쪽이 거를지 정한다. 340 m/s(약 1,224 km/h)는 여객기 대지속도로는
@@ -266,7 +267,7 @@ def main():
             started = time.time()
             try:
                 result = run_date(spark, date_str) or {}
-                write_run_record("gold", date_str, dict(result, duration_s=round(time.time() - started, 1)))
+                write_run_record("gold", date_str, dict(result, duration_s=round(time.time() - started, 1), code_version=CODE_VERSION))
             except Exception as e:
                 failed.append(date_str)
                 reason = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
@@ -360,6 +361,7 @@ def run_date(spark, date_str):
     write_marker(
         GOLD_MARKER_PREFIX, date_str, n_traj,
         f"{GOLD_TRAJECTORY_TABLE},{GOLD_AIRCRAFT_DAILY_TABLE},{GOLD_TRAFFIC_HOURLY_TABLE}",
+        code_version=CODE_VERSION,
     )
     n_outlier = trajectory.filter(F.col("is_outlier")).count()
     print(f"GOLD_DONE: date={date_str} outliers={n_outlier}")
