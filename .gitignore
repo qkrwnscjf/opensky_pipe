@@ -10,6 +10,10 @@ env/
 *.parquet
 *.csv
 *.json
+# 화면 설치·실행에 필요한 설정 파일은 예외로 추적한다(R-1, 2026-10-12 — 개인정보 0건 확인)
+!flight-ui/package.json
+!flight-ui/package-lock.json
+!flight-ui/public/manifest.json
 
 # 4. Spark/Java 관련 임시 폴더
 checkpoints/
