@@ -46,12 +46,13 @@ import json
 import math
 import os
 import sys
+import time
 import uuid
 
 from botocore.exceptions import ClientError
 from pyspark.sql import functions as F
 
-from lakehouse_common import LAKE_BUCKET, build_spark, s3_client, validate_date, write_marker
+from lakehouse_common import LAKE_BUCKET, build_spark, s3_client, validate_date, write_marker, write_run_record
 
 # DAG의 BRONZE_PREFIX와 같은 값이어야 한다. boto3는 접두사, Spark는 s3a:// 경로로 쓴다.
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "positions")
@@ -172,11 +173,16 @@ def main():
     failed = []
     try:
         for date_str in dates:
+            started = time.time()
             try:
-                run_date(client, get_spark, date_str)
+                result = run_date(client, get_spark, date_str) or {}
+                write_run_record("bronze_merge", date_str, dict(result, duration_s=round(time.time() - started, 1)))
             except Exception as e:
                 failed.append(date_str)
-                print(f"MERGE_DATE_FAILED: date={date_str} ({str(e).splitlines()[0][:200] if str(e) else type(e).__name__})")
+                reason = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                print(f"MERGE_DATE_FAILED: date={date_str} ({reason})")
+                write_run_record("bronze_merge", date_str, {"status": "failed", "error": reason,
+                                                            "duration_s": round(time.time() - started, 1)})
     finally:
         if "spark" in holder:
             holder["spark"].stop()
@@ -199,7 +205,7 @@ def run_date(client, get_spark, date_str):
             # 확정 후에 죽었다. 병합본이 기준이므로 남은 원본만 지우고 마무리한다.
             print(f"MERGE_RECOVERY: 확정 후 중단 발견 — 남은 원본 삭제로 마무리 (run={manifest['run_id']})")
             finish(client, date_str, manifest, stage_root)
-            return
+            return {"status": "recovered", "run_id": manifest["run_id"]}
         # 확정 전에 죽었다. 원본은 온전하다. 일부만 복사된 병합본이 라이브 경로에 남아
         # 있으면 다음 목록에 원본으로 섞여 행이 두 번 들어가므로 반드시 먼저 지운다.
         partial = [k for k in finals if exists(client, k)]
@@ -215,7 +221,7 @@ def run_date(client, get_spark, date_str):
         # 행 수는 세지 않는다(Spark를 띄울 이유가 없음) — 마커의 rows=-1은 "안 셈"이다.
         write_marker(MERGE_MARKER_PREFIX, date_str, -1, f"{len(originals)} file(s), nothing to merge")
         print(f"MERGE_SKIP: date={date_str} files={len(originals)}")
-        return
+        return {"status": "skip", "files": len(originals)}
     in_bytes = sum(o["Size"] for o in originals)
     n_files = max(1, math.ceil(in_bytes / TARGET_FILE_BYTES))
     print(f"MERGE_PLAN: files={len(originals)} bytes={in_bytes} -> target_files={n_files}")
@@ -275,6 +281,8 @@ def run_date(client, get_spark, date_str):
 
     # ── 7~9. 원본 삭제 → 정리 → 마커 ─────────────────────────
     finish(client, date_str, manifest, stage_root)
+    return {"status": "merged", "rows": n_in, "files_in": len(originals), "files_out": len(merged),
+            "bytes_in": in_bytes, "bytes_out": out_bytes}
 
 
 if __name__ == "__main__":

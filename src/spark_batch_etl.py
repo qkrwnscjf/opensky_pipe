@@ -27,10 +27,12 @@ dags/flight_lakehouse_etl.py가 마커 파일을 비교해 고르고, 날짜마�
 import argparse
 import os
 import sys
+import time
 
+from pyspark.sql import functions as F
 from pyspark.sql.functions import lit
 
-from lakehouse_common import build_spark, validate_date, write_marker, write_partition
+from lakehouse_common import build_spark, validate_date, write_marker, write_partition, write_quality, write_run_record
 
 # ---------------------------------------------------------------
 # 설정
@@ -62,11 +64,16 @@ def main():
     failed = []
     try:
         for date_str in dates:
+            started = time.time()
             try:
-                run_date(spark, date_str)
+                result = run_date(spark, date_str) or {}
+                write_run_record("silver", date_str, dict(result, duration_s=round(time.time() - started, 1)))
             except Exception as e:
                 failed.append(date_str)
-                print(f"ETL_DATE_FAILED: date={date_str} ({str(e).splitlines()[0][:200] if str(e) else type(e).__name__})")
+                reason = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                print(f"ETL_DATE_FAILED: date={date_str} ({reason})")
+                write_run_record("silver", date_str, {"status": "failed", "error": reason,
+                                                      "duration_s": round(time.time() - started, 1)})
     finally:
         spark.stop()
     print(f"ETL_BATCH_DONE: dates={len(dates)} failed={failed}")
@@ -111,7 +118,29 @@ def run_date(spark, date_str):
         # 영구 누락이 되고, 안 쓰면 전자는 다음 날 한 번 더 헛도는 것으로
         # 끝난다. 비용이 훨씬 싼 쪽을 고른다.
         print(f"ETL_EMPTY: {date_str} — 마커를 쓰지 않으므로 다음 실행에서 재시도된다")
-        return
+        return {"status": "empty", "raw_rows": raw_count}
+
+    # ── 2-1. 품질 지표 + 날짜 일치 검사 (1-11, 2026-10-12) ─────────
+    # event_date는 --date 인자에서 만든다(아래 3). 그래서 디렉터리 이름과 내용의 날짜가 어긋난 파티션을 넣으면
+    # 조용히 틀린 event_date가 붙었다(합성 데이터로 확인됨, CLAUDE.md). 행의 timestamp(UTC) 날짜가 인자와 다른
+    # 행이 하나라도 있으면 쓰지 않고 실패시킨다 — 정상 운용에서는 Bronze의 dt가 같은 timestamp에서 나오므로
+    # 0이어야 한다(5,966행 실측 0). 지표는 집계 한 번으로 같이 구해 날짜별로 MinIO에 남긴다.
+    q = df_dedup.agg(
+        F.sum(F.when(F.to_date("timestamp") != F.lit(date_str).cast("date"), 1).otherwise(0)).alias("date_mismatch"),
+        F.sum(F.when(F.col("latitude").isNull() | F.col("longitude").isNull(), 1).otherwise(0)).alias("null_position"),
+        F.sum(F.when(F.col("baro_altitude").isNull(), 1).otherwise(0)).alias("null_baro_altitude"),
+        F.sum(F.when(F.col("velocity").isNull(), 1).otherwise(0)).alias("null_velocity"),
+        F.sum(F.when((F.abs("latitude") > 90) | (F.abs("longitude") > 180), 1).otherwise(0)).alias("bad_position"),
+        F.sum(F.when((F.col("baro_altitude") < -500) | (F.col("baro_altitude") > 20000), 1).otherwise(0)).alias("bad_altitude"),
+        F.sum(F.when((F.col("velocity") < 0) | (F.col("velocity") > 400), 1).otherwise(0)).alias("bad_velocity"),
+        F.countDistinct("icao24").alias("aircraft"),
+    ).collect()[0].asDict()
+    quality = {k: int(v or 0) for k, v in q.items()}
+    quality.update(raw_rows=raw_count, rows=dedup_count, duplicates_removed=raw_count - dedup_count)
+    write_quality("silver", date_str, quality)
+    print(f"ETL_QUALITY: {quality}")
+    if quality["date_mismatch"]:
+        raise RuntimeError(f"date mismatch: {quality['date_mismatch']}/{dedup_count} rows not on {date_str}")
 
     # ── 3. 피처 ──────────────────────────────────────────────
     # 수집 스키마 전체를 그대로 피처로 넘긴다(0-6 결정). icao24는 피처가
@@ -135,6 +164,7 @@ def run_date(spark, date_str):
     # 반드시 쓰기 성공 뒤. 위에서 예외가 나면 여기 도달하지 않는다.
     write_marker(MARKER_PREFIX, date_str, dedup_count, SILVER_TABLE)
     print(f"ETL_DONE: date={date_str} rows={dedup_count}")
+    return {"status": "success", "rows": dedup_count, "raw_rows": raw_count}
 
 
 if __name__ == "__main__":

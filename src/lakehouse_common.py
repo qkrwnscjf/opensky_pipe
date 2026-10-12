@@ -79,6 +79,13 @@ def write_partition(df, table, partition_col):
     spark = df.sparkSession
     spark.sql("CREATE NAMESPACE IF NOT EXISTS lake.db")
     if spark.catalog.tableExists(table):
+        # 1-10 (2026-10-12): 코드가 새 컬럼을 내보내면 기존 테이블에 먼저 추가한다(Iceberg는 컬럼 추가가 메타데이터
+        # 변경뿐이라 기존 파일을 다시 쓰지 않는다). 그러지 않으면 overwritePartitions가 컬럼 수 불일치로 실패한다.
+        existing = {f.name for f in spark.table(table).schema.fields}
+        for field in df.schema.fields:
+            if field.name not in existing:
+                spark.sql(f"ALTER TABLE {table} ADD COLUMN {field.name} {field.dataType.simpleString()}")
+                print(f"SCHEMA_COLUMN_ADDED: {table}.{field.name} {field.dataType.simpleString()}")
         df.writeTo(table).overwritePartitions()
         return "overwrite"
     # 파티션 명세는 테이블 속성이라 최초 생성 때만 정해진다. Iceberg는 hidden
@@ -106,3 +113,37 @@ def write_marker(marker_prefix, date_str, rows, target):
     )
     s3_client().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body.encode("utf-8"))
     print(f"ETL_MARKER_WRITTEN: s3://{LAKE_BUCKET}/{key}")
+
+
+# 1-11·1-12 (2026-10-12): 실행 결과와 품질 지표를 MinIO에 남긴다. Airflow 메타DB와 태스크 로그는 세션마다 사라져
+# "지난번에 무엇이 실패했고 왜"가 남지 않았다 — MinIO만 세션을 넘어 살아남는다(완료 마커와 같은 이유).
+RUNS_PREFIX = os.getenv("ETL_RUNS_PREFIX", "etl_runs")
+QUALITY_PREFIX = os.getenv("ETL_QUALITY_PREFIX", "etl_quality")
+
+
+def _put_json(key, obj):
+    import json
+
+    s3_client().put_object(Bucket=LAKE_BUCKET, Key=key, Body=json.dumps(obj, default=str, indent=1).encode("utf-8"))
+    return key
+
+
+def write_run_record(stage, date_str, record):
+    """`<RUNS_PREFIX>/<stage>/dt=<날짜>/<UTC 시각>.json` — 실행할 때마다 하나(덮어쓰지 않음). 기록 실패는 경고만:
+    기록 장치 때문에 ETL이 실패하면 안 된다."""
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    try:
+        key = _put_json(f"{RUNS_PREFIX}/{stage}/dt={date_str}/{stamp}.json",
+                        dict(record, stage=stage, date=date_str, recorded_at=stamp + "Z"))
+        print(f"RUN_RECORD_WRITTEN: s3://{LAKE_BUCKET}/{key} status={record.get('status')}")
+    except Exception as e:
+        print(f"RUN_RECORD_WARNING: {e}")
+
+
+def write_quality(stage, date_str, metrics):
+    """`<QUALITY_PREFIX>/<stage>/dt=<날짜>/quality.json` — 날짜별 최신 품질 지표(재처리하면 덮어씀)."""
+    try:
+        key = _put_json(f"{QUALITY_PREFIX}/{stage}/dt={date_str}/quality.json", dict(metrics, stage=stage, date=date_str))
+        print(f"QUALITY_WRITTEN: s3://{LAKE_BUCKET}/{key}")
+    except Exception as e:
+        print(f"QUALITY_WARNING: {e}")

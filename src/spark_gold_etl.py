@@ -55,12 +55,13 @@ segment_id를 받게 된다. 하루치 Silver는 약 1.7만 행이라 비용은 
 import argparse
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 
-from lakehouse_common import build_spark, validate_date, write_marker, write_partition
+from lakehouse_common import build_spark, validate_date, write_marker, write_partition, write_run_record
 
 SILVER_TABLE = os.getenv("SILVER_TABLE", "lake.db.flight_features")
 GOLD_TRAJECTORY_TABLE = os.getenv("GOLD_TRAJECTORY_TABLE", "lake.db.gold_flight_trajectory")
@@ -70,6 +71,11 @@ GOLD_TRAFFIC_HOURLY_TABLE = os.getenv("GOLD_TRAFFIC_HOURLY_TABLE", "lake.db.gold
 # Silver 마커(etl_markers/)와 겹치지 않게 따로 둔다. Silver만 끝나고 Gold가 실패한
 # 날짜도 다음 실행에서 Gold만 따라잡을 수 있어야 하기 때문이다.
 GOLD_MARKER_PREFIX = os.getenv("GOLD_MARKER_PREFIX", "etl_markers_gold")
+
+# 1-10 (2026-10-12): 궤적 이상치 표시 기준. 두 연속 보고 사이 계산 속도가 이보다 빠르면 is_outlier=true.
+# 지우지 않고 표시만 한다 — 학습·분석하는 쪽이 거를지 정한다. 340 m/s(약 1,224 km/h)는 여객기 대지속도로는
+# 강한 뒷바람을 받아도 넘기 어려운 값이다(10-02~04 실측: 계산 속도 p99 307 m/s, 최대 501.6 m/s, 340 초과 0.15%).
+GOLD_OUTLIER_SPEED_MPS = float(os.getenv("GOLD_OUTLIER_SPEED_MPS", "340"))
 
 # 같은 기체라도 위치 보고 사이 공백이 이보다 길면 새 구간(= 다른 비행)으로 본다.
 # 실측(09-23): 연속 위치 간격 p50 11초, p90 20초. 300초 초과 공백은 87건이고,
@@ -183,6 +189,8 @@ def build_trajectory(positions):
         .withColumn("velocity_change_mps", F.col("velocity") - F.col("prev_velocity"))
         # 라벨: 다음 위치까지의 시간. 다음 위치 자체는 next_latitude/next_longitude.
         .withColumn("next_dt_s", F.col("next_time_position") - F.col("time_position"))
+        # 1-10: 표시만(구간의 첫 행은 계산 속도가 없어 false)
+        .withColumn("is_outlier", F.coalesce(F.col("calc_speed_mps") > F.lit(GOLD_OUTLIER_SPEED_MPS), F.lit(False)))
     )
 
     return traj.select(
@@ -193,7 +201,7 @@ def build_trajectory(positions):
         "dt_s", "dist_m", "calc_speed_mps", "heading_change_deg",
         "alt_change_m", "velocity_change_mps",
         "next_latitude", "next_longitude", "next_baro_altitude", "next_dt_s",
-        "owner_date",
+        "is_outlier", "owner_date",
     )
 
 
@@ -201,7 +209,13 @@ def build_aircraft_daily(positions_today, trajectory_today):
     """날짜 × 기체. 지상 행도 포함한다(사용자 결정) — 공항 체류도 DA 대상이다."""
     base = positions_today.groupBy("icao24").agg(
         # 하루 사이에도 편명이 바뀔 수 있어 마지막 보고 기준으로 고른다.
-        F.max_by("callsign", "time_position").alias("callsign"),
+        # 1-9 (2026-10-12): 단, 'N/A'(편명 없이 온 보고)는 후보에서 뺀다. 예전에는 마지막 보고가 N/A면 그날 편명이
+        # 있었던 기체도 N/A로 남았다(10-02~04 실측: N/A 26건 중 11건이 그날 편명이 있던 기체). 하루 종일 편명이
+        # 없었을 때만 N/A. max_by는 정렬 기준이 null인 행을 건너뛴다.
+        F.coalesce(
+            F.max_by("callsign", F.when(F.col("callsign") != F.lit("N/A"), F.col("time_position"))),
+            F.lit("N/A"),
+        ).alias("callsign"),
         F.max_by("origin_country", "time_position").alias("origin_country"),
         F.min("event_time").alias("first_seen"),
         F.max("event_time").alias("last_seen"),
@@ -249,11 +263,16 @@ def main():
     failed = []
     try:
         for date_str in dates:
+            started = time.time()
             try:
-                run_date(spark, date_str)
+                result = run_date(spark, date_str) or {}
+                write_run_record("gold", date_str, dict(result, duration_s=round(time.time() - started, 1)))
             except Exception as e:
                 failed.append(date_str)
-                print(f"GOLD_DATE_FAILED: date={date_str} ({str(e).splitlines()[0][:200] if str(e) else type(e).__name__})")
+                reason = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                print(f"GOLD_DATE_FAILED: date={date_str} ({reason})")
+                write_run_record("gold", date_str, {"status": "failed", "error": reason,
+                                                    "duration_s": round(time.time() - started, 1)})
             finally:
                 spark.catalog.clearCache()  # 날짜마다 cache()한 것을 풀어 다음 날짜가 메모리를 이어받지 않게
     finally:
@@ -289,7 +308,7 @@ def run_date(spark, date_str):
         # Silver와 같은 이유로 마커를 쓰지 않는다 — "정말 없음"과 "읽기 실패"를
         # 구분할 수 없고, 마커를 안 쓰는 쪽의 비용이 훨씬 싸다.
         print(f"GOLD_EMPTY: {date_str} — 마커를 쓰지 않으므로 다음 실행에서 재시도된다")
-        return
+        return {"status": "empty", "silver_rows": today_rows}
 
     # ── 2. 위치 보고 단위로 줄이기 ───────────────────────────
     positions = dedup_positions(silver).cache()
@@ -342,7 +361,10 @@ def run_date(spark, date_str):
         GOLD_MARKER_PREFIX, date_str, n_traj,
         f"{GOLD_TRAJECTORY_TABLE},{GOLD_AIRCRAFT_DAILY_TABLE},{GOLD_TRAFFIC_HOURLY_TABLE}",
     )
-    print(f"GOLD_DONE: date={date_str}")
+    n_outlier = trajectory.filter(F.col("is_outlier")).count()
+    print(f"GOLD_DONE: date={date_str} outliers={n_outlier}")
+    return {"status": "success", "trajectory_rows": n_traj, "segments": n_segments, "outliers": n_outlier,
+            "aircraft_daily_rows": n_daily, "traffic_hourly_rows": n_hourly}
 
 
 if __name__ == "__main__":
