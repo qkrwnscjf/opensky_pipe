@@ -3,6 +3,7 @@ import json
 import os
 from flight_schema import build_record
 from kafka import KafkaProducer
+from kafka.errors import KafkaError
 from datetime import datetime
 import time
 
@@ -193,7 +194,7 @@ _null_key_total = 0
 
 
 def fetch_and_send():
-    global _sent_watermark, _null_key_total, _skipped_repeat_total, _skipped_older_total
+    global _sent_watermark, _null_key_total, _skipped_repeat_total, _skipped_older_total, _last_error
     null_key_batch = 0
     try:
         response = session.get(URL, params=PARAMS, timeout=10)
@@ -248,8 +249,31 @@ def fetch_and_send():
         return "sent", snapshot_time
 
     except Exception as e:
-        print(f"데이터 수집 중 오류 발생: {e}")
+        _last_error = classify_error(e)
+        print(f"FETCH_ERROR kind={_last_error['kind']} status={_last_error['status']} error={e}")
         return "error", None
+
+
+# R-10 (2026-10-13): 실패 원인을 종류별로 남긴다. 예전에는 OpenSky 오류(429 할당량 초과 등)·네트워크·응답 해석·
+# Kafka 전송 실패가 모두 outcome "error" 하나였고, 원인은 사람이 읽는 오류 문장에만 있었다. outcome은 그대로
+# "error"라 다음 요청 시점 계산(next_poll_delay)은 바뀌지 않는다 — 종류는 POLL_METRIC의 error 필드로 나간다.
+_last_error = None
+
+
+def classify_error(e):
+    status = None
+    if isinstance(e, requests.HTTPError):
+        kind = "http"
+        status = getattr(e.response, "status_code", None)
+    elif isinstance(e, ValueError):  # JSON 해석 실패(requests의 JSONDecodeError도 ValueError)
+        kind = "parse"
+    elif isinstance(e, requests.RequestException):
+        kind = "network"
+    elif isinstance(e, KafkaError):
+        kind = "kafka"
+    else:
+        kind = "other"
+    return {"kind": kind, "status": status}
 
 if __name__ == "__main__":
     print(f"수집 범위: Lat({LAT_MIN}~{LAT_MAX}), Lon({LON_MIN}~{LON_MAX})")
@@ -262,6 +286,7 @@ if __name__ == "__main__":
     try:
         while True:
             fetched_at = time.time()
+            _last_error = None
             outcome, snap = fetch_and_send()
             now = time.time()
             if POLL_MODE == "fixed":
@@ -275,6 +300,7 @@ if __name__ == "__main__":
                 "age_s": round(fetched_at - snap, 2) if snap else None,
                 "offset_s": round(align["offset"], 2) if POLL_MODE != "fixed" else None,
                 "next_in_s": round(delay, 2),
+                "error": _last_error,  # R-10: {"kind": http|network|parse|kafka|other, "status": HTTP 상태} 또는 null
             }))
             time.sleep(delay)
     except KeyboardInterrupt:

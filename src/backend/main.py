@@ -284,26 +284,37 @@ async def _broadcast_flights():
 
 
 def _listen_for_notifications(loop: asyncio.AbstractEventLoop):
+    # R-5 (2026-10-13): 듣기만 하는 연결은 아무것도 보내지 않으므로, 상대가 연결 종료를 알리지 못한 채 사라지면
+    # (네트워크가 끊긴 사이 Postgres가 죽었다 돌아온 경우) select가 영원히 빈손으로 돌아 WebSocket 푸시만 멈춘다.
+    # backend는 정상으로 보이고 로그도 없다(실측: 푸시 0건이 3분 넘게 지속). 알림이 5초 동안 없으면 SELECT 1로
+    # 왕복을 한 번 하고, tcp_user_timeout으로 응답 없는 연결을 15초 안에 오류로 만든다 → 아래 except에서 다시 연결.
+    conn = None
     while True:
         try:
             conn = psycopg2.connect(
-                host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
+                host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD,
+                connect_timeout=5, tcp_user_timeout=15000,
             )
             conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
             cur = conn.cursor()
             cur.execute("LISTEN flight_update;")
             print("WS_LISTENER: listening for flight_update notifications")
             while True:
-                if not select.select([conn], [], [], 5)[0]:
-                    continue
-                conn.poll()
+                if select.select([conn], [], [], 5)[0]:
+                    conn.poll()
+                else:
+                    cur.execute("SELECT 1")  # 연결 확인. 이 사이에 온 알림도 conn.notifies에 쌓인다
                 while conn.notifies:
                     conn.notifies.pop()
                     asyncio.run_coroutine_threadsafe(_broadcast_flights(), loop)
         except Exception as e:
             print(f"WS_LISTENER_WARNING: {e} — retrying in 5s")
-            import time
-
+            if conn is not None:
+                try:
+                    conn.close()  # 예전에는 닫지 않아 재연결마다 이전 연결이 남았다
+                except Exception:
+                    pass
+                conn = None
             time.sleep(5)
 
 

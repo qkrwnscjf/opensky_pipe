@@ -196,11 +196,14 @@ HOST=127.0.0.1 npm start
 ### 5-5. 종료
 
 ```
+docker compose --profile airflow-ui --profile mlflow-ui --profile serving stop
+docker compose --profile airflow-ui --profile mlflow-ui --profile serving rm -fv
 docker compose --profile airflow-ui --profile mlflow-ui --profile serving down
 ```
 
 - 쓰고 나면 내려 주세요. 기본 비밀번호로 여러 포트가 열립니다.
-- 레이크(MinIO)와 MLflow 기록은 이름 있는 볼륨에 남습니다. `down -v`는 이것까지 지웁니다.
+- `rm -fv`는 이 프로젝트 컨테이너가 쓰던 이름 없는 볼륨(Kafka, PostgreSQL, 체크포인트)만 지웁니다. 다음 실행은 어차피 새 볼륨으로 시작하므로, 이 단계를 빼면 쓰지 않는 볼륨이 실행할 때마다 쌓입니다.
+- 레이크(MinIO)와 MLflow 기록은 이름 있는 볼륨에 남습니다. `down -v`는 이것까지 지우니 쓰지 마세요.
 - 실시간 데이터(Kafka, PostgreSQL)는 다음 실행 때 새로 시작합니다(의도된 설계).
 
 ---

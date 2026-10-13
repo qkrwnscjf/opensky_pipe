@@ -19,11 +19,45 @@ from flight_schema import FLIGHT_FIELDS, FIELD_NAMES
 # ---------------------------------------------------------------
 # 1. Spark 세션 생성
 # ---------------------------------------------------------------
-# 1-29: JVM을 띄우기 전에 SIGTERM을 '무시'로 둔다. 자식 프로세스(JVM)는 무시 설정을 물려받고, HotSpot은 시작
+# 1-29: JVM은 SIGTERM이 '무시'된 상태로 시작해야 한다. 자식 프로세스(JVM)는 무시 설정을 물려받고, HotSpot은 시작
 # 시점에 무시돼 있는 SIGTERM에는 자기 종료 훅을 걸지 않는다. 그러지 않으면 docker stop의 SIGTERM을 JVM도 받아
 # SparkContext를 먼저 멈춰 버려 마무리 배치(drain_cold)를 쓸 수 없었다(실측: "Cannot call methods on a stopped
-# SparkContext"). 실제 처리기는 맨 아래에서 Python에만 다시 건다.
-signal.signal(signal.SIGTERM, signal.SIG_IGN)
+# SparkContext").
+#
+# R-8 (2026-10-13): 예전에는 Python 자신도 SIGTERM을 무시로 두고 처리기는 쿼리를 시작한 뒤에야 걸었다. 그 사이
+# (데워진 재시작 약 15초, 세션 첫 시작 약 67초)에 종료하면 신호가 버려져 유예 90초를 다 채우고 강제 종료됐다
+# (실측: 시작 15초 뒤 종료 → 94초, exit 137). 이제 처리기는 맨 처음에 걸고, 무시 설정은 JVM을 띄우는 자식
+# 프로세스에만 준다(pyspark가 JVM을 띄울 때 쓰는 Popen의 preexec_fn — fork 뒤 exec 전에 자식에서만 실행된다).
+# 시작 도중에 받은 신호는 표시만 남고, 쿼리가 시작되면 메인 루프가 바로 마무리(drain_cold)로 넘어간다.
+_shutdown = threading.Event()
+
+
+def _on_signal(signum, _frame):
+    print(f"SHUTDOWN_REQUESTED: signal {signum}")
+    _shutdown.set()
+
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGINT, _on_signal)
+
+import pyspark.java_gateway as _java_gateway  # noqa: E402
+
+_popen = _java_gateway.Popen
+
+
+def _popen_jvm_ignoring_sigterm(*args, **kwargs):
+    inner = kwargs.get("preexec_fn")
+
+    def _preexec():
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if inner:
+            inner()
+
+    kwargs["preexec_fn"] = _preexec
+    return _popen(*args, **kwargs)
+
+
+_java_gateway.Popen = _popen_jvm_ignoring_sigterm
 
 minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 minio_access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
@@ -742,9 +776,47 @@ def save_to_hot(batch_df, batch_id):
 # 배치가 조용히 사라진다 — 2026-09-10 실측: 재기동 후 batch 191이 SINK_METRIC에는
 # 있는데 SPARK_METRIC에는 없었고 METRIC_GAP도 뜨지 않았다. 기동 시 1회뿐이라
 # 비싼 호출을 해도 된다. (첫 폴링에는 비교 기준이 없으므로 간극 보고는 하지 않는다.)
+def _offsets(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def skipped_rows(source):
+    """R-7 (2026-10-13): 이 배치가 Kafka에서 건너뛴 행 수 = Σ(끝 오프셋 − 시작 오프셋) − 실제로 읽은 행 수.
+
+    failOnDataLoss=false라 체크포인트가 가리키던 오프셋이 보존 기간에 밀려 지워졌으면 Spark는 남은 가장 이른
+    오프셋부터 이어 간다. 그때 Spark 자체 로그는 파티션·쿼리마다 'Some data may be lost' 경고와 스택트레이스뿐이라
+    (실측: 200행 삭제에 경고 12건) 몇 행이, hot·cold 중 어디서 빠졌는지가 나오지 않았다. 이 producer는 트랜잭션을
+    쓰지 않아 오프셋이 연속이므로, 평소에는 두 값이 같다(0). 첫 배치(시작 오프셋 없음)는 계산하지 않는다.
+    """
+    start = _offsets(source.get("startOffset"))
+    if not start:
+        return 0
+    span = 0
+    for topic, parts in _offsets(source.get("endOffset")).items():
+        before = start.get(topic) or {}
+        for part, off in parts.items():
+            if part in before:
+                span += off - before[part]
+    return max(span - (source.get("numInputRows") or 0), 0)
+
+
+def _ran(progress):
+    return bool(progress) and "addBatch" in (progress.get("durationMs") or {})
+
+
 def start_metrics_reporter(query, label="hot", interval_sec=1):
     def _emit(progress):
         sources = progress.get("sources") or [{}]
+        skipped = skipped_rows(sources[0])
+        if skipped:
+            # 영구 원본(Bronze)에 남는 유일한 조용한 유실 경로라 cold 쪽 줄이 특히 중요하다.
+            print(f"DATA_SKIPPED[{label}]: batch={progress.get('batchId')} rows={skipped} "
+                  f"— Kafka 보존 기간이 지나 지워진 구간을 건너뜀(failOnDataLoss=false)")
         print("SPARK_METRIC " + json.dumps({
             "query": label,
             "batchId": progress.get("batchId"),
@@ -761,7 +833,10 @@ def start_metrics_reporter(query, label="hot", interval_sec=1):
         while query.isActive:
             try:
                 progress = query.lastProgress
-                batch_id = progress.get("batchId") if progress else None
+                # 2026-10-13 (R-7 검증 중 발견): 데이터가 없으면 Spark는 '다음에 돌 배치 번호'로 빈 진행 보고를 낸다.
+                # 그걸 먼저 기록하면 같은 번호의 실제 배치를 건너뛰었다(실측: 행을 쓴 hot 배치 26개 중 2개 누락 —
+                # 합성 부하처럼 데이터가 띄엄띄엄 올 때). 실제로 돈 배치에만 있는 durationMs.addBatch로 거른다.
+                batch_id = progress.get("batchId") if _ran(progress) else None
 
                 if batch_id is not None and batch_id > last_emitted:
                     first_poll = last_emitted < 0
@@ -774,7 +849,7 @@ def start_metrics_reporter(query, label="hot", interval_sec=1):
                         # 한 번 읽어 되메운다.
                         backfill = sorted(
                             (p for p in (query.recentProgress or [])
-                             if p.get("batchId") is not None
+                             if p.get("batchId") is not None and _ran(p)
                              and last_emitted < p["batchId"] <= batch_id),
                             key=lambda p: p["batchId"],
                         )
@@ -953,21 +1028,11 @@ print("TACTICAL_ETL_SYSTEM: OPERATIONAL")
 #
 # 1-29 (2026-10-12): 종료 신호(SIGTERM — docker compose down/stop)를 받으면 cold에 남은 것을 쓰고 끝낸다.
 # cold 트리거가 60초라 마지막 콜드 배치 이후 분량은 Kafka에만 있고, 다음 세션은 Kafka를 비우므로 그대로 두면
-# 영구 유실이었다. 신호 처리기는 표시만 하고, 실제 마무리는 메인 루프에서 한다(신호 처리기 안에서 Spark를
-# 호출하지 않기 위해). 마무리: hot·cold를 멈추고 → 같은 체크포인트로 cold를 availableNow(지금 있는 것을
+# 영구 유실이었다. 신호 처리기(맨 위 _on_signal, R-8)는 표시만 하고, 실제 마무리는 메인 루프에서 한다(신호 처리기
+# 안에서 Spark를 호출하지 않기 위해). 마무리: hot·cold를 멈추고 → 같은 체크포인트로 cold를 availableNow(지금 있는 것을
 # 전부 처리하고 끝나는 트리거)로 한 번 돌린다 → 마지막으로 커밋된 지점부터 이어서 쓰므로 빠짐도 겹침도 없다
 # (cold를 배치 도중에 멈췄다면 그 배치는 커밋 전이라 다시 쓰인다 — at-least-once, Silver가 중복 제거).
 COLD_DRAIN_TIMEOUT_S = 70  # compose stop_grace_period(90초) 안에서 끝나도록. 실측 마무리 27~37초(10-12)
-_shutdown = threading.Event()
-
-
-def _on_signal(signum, _frame):
-    print(f"SHUTDOWN_REQUESTED: signal {signum}")
-    _shutdown.set()
-
-
-signal.signal(signal.SIGTERM, _on_signal)
-signal.signal(signal.SIGINT, _on_signal)
 
 
 def drain_cold():
