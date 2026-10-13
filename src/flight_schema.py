@@ -15,6 +15,7 @@
 
 # (필드명, 타입, OpenSky /states/all state 벡터 인덱스)
 # 인덱스가 None이면 state 벡터가 아니라 응답 최상위(data['time'])에서 온다.
+# 인덱스가 "ingest"면 OpenSky가 아니라 producer가 채운다(응답을 받은 시각).
 # 인덱스는 OpenSky API 문서의 state vector 순서를 그대로 따른다.
 FLIGHT_FIELDS = [
     ("icao24",          "string",  0),
@@ -35,20 +36,27 @@ FLIGHT_FIELDS = [
     ("spi",             "boolean", 15),
     ("position_source", "int",     16),
     ("timestamp",       "long",    None),
+    # 수집 시각 (2026-10-12, 사용자 결정): producer가 OpenSky 응답을 받은 순간의 UTC epoch 초(소수). `timestamp`
+    # (OpenSky 스냅샷 시각)와의 차이가 OpenSky 자체 지연, 이후 단계(DB 반영·화면)와의 차이가 파이프라인 지연이 된다.
+    # Spark가 TimestampType으로 바꿔 Bronze·Silver·flight_current에 같은 이름으로 싣는다.
+    ("ingested_at",     "double",  "ingest"),
 ]
 
 FIELD_NAMES = [name for name, _, _ in FLIGHT_FIELDS]
 
 
-def build_record(state, snapshot_time):
+def build_record(state, snapshot_time, ingested_at=None):
     """OpenSky state 벡터 하나를 Kafka에 실을 dict로 만든다.
 
     변환 규칙도 여기 둔다. producer에만 있으면 스키마와 또 갈라진다.
+    ingested_at: producer가 응답을 받은 epoch 초(소수). 없으면 None.
     """
     record = {}
     for name, _type, idx in FLIGHT_FIELDS:
         if idx is None:
             record[name] = snapshot_time
+        elif idx == "ingest":
+            record[name] = round(ingested_at, 3) if ingested_at is not None else None
         else:
             record[name] = state[idx] if idx < len(state) else None
 

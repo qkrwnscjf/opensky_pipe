@@ -53,7 +53,7 @@ engine = create_engine(DB_URL)
 FLIGHTS_QUERY = text("""
     SELECT icao24, callsign, origin_country, latitude, longitude, velocity,
            COALESCE(geo_altitude, baro_altitude) AS altitude, timestamp, true_track,
-           on_ground, vertical_rate, squawk
+           on_ground, vertical_rate, squawk, ingested_at, time_position
     FROM flight_current
     WHERE timestamp >= NOW() - INTERVAL '5 minutes'
     ORDER BY icao24
@@ -90,6 +90,10 @@ def fetch_flights():
                 "on_ground": row.on_ground,
                 "vertical_rate": row.vertical_rate,
                 "squawk": row.squawk,
+                # 수집 시각(2026-10-12): producer가 OpenSky 응답을 받은 순간. timestamp와의 차이 = OpenSky 자체 지연
+                "ingested_at": iso_utc(row.ingested_at),
+                # 위치를 실제로 보고한 시각(epoch 초) — 화면의 위치 보정 기준(2026-10-13)
+                "time_position": row.time_position,
             }
             for row in result
         ]

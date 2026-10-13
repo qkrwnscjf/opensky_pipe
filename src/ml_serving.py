@@ -11,7 +11,8 @@
    보간, 보고 공백 30초 이하일 때만)이다. 이 데이터는 정답이 10초 만에 도착하므로 모니터링이 추정이
    아니라 실제 적중률이다.
 3. 모니터링: `ML_MONITOR_WINDOW_S`(기본 300초)마다 모델·기준선의 적중률(50/100/200 m)과 오차를
-   집계하고, 입력 분포가 학습 데이터와 얼마나 달라졌는지(PSI, 속도·고도)를 계산해
+   집계하고, 입력 분포가 학습 데이터와 얼마나 달라졌는지(PSI, 속도·고도 — 판정은 항공기 단위로 최근 6시간,
+   200대 이상일 때만, 0.25 이상이면 변화. 아래 PSI_* 상수 설명 참고)를 계산해
    MLflow 실험 `trajectory-10s-monitoring`에 기록하고 화면용 `ml_monitoring.json`을 쓴다.
 4. champion이 바뀌면(재학습으로 승격) 다음 집계 때 새 버전으로 갈아 끼운다.
 
@@ -55,6 +56,17 @@ NO_CHAMPION_RETRY_S = 60
 WINDOWS_KEEP = 48
 PSI_FEATURES = ("velocity", "baro_altitude")
 
+# 드리프트 판정 기준 (2026-10-12, 사용자 결정: 권장값). Gold 8일치로 역산한 값이다(docs/BENCHMARKS.md):
+# - 같은 항공기의 연속 보고는 고도·속도가 거의 같아 **유효 표본은 행 수가 아니라 항공기 수**다. 그래서 PSI를
+#   항공기당 1개(관측 중앙값)로 계산한다. 행 단위로 재면 60분 창(약 2,400행)도 실제 변화 없이 41%가 0.25를 넘었다.
+# - 항공기 200대 미만이면 판정하지 않는다: 100~200대에서도 변화 없이 17%가 0.25를 넘었고, 200대 이상에서는 0%
+#   (중앙값 0.107, p95 0.215). 이 공역은 하루 약 220대라 200대 ≈ 운영 약 4시간 → 최대 6시간을 굴려 모은다.
+# - 기준은 0.25 하나: 이상이면 '변화(shifted)', 미만이면 '정상(stable)'. 관례적 0.1(주의)은 200대 이상에서도
+#   변화 없이 53%가 넘어 이 데이터에서는 잡음 수준이라 쓰지 않는다.
+PSI_MIN_AIRCRAFT = int(os.getenv("ML_PSI_MIN_AIRCRAFT", "200"))
+PSI_SPAN_S = int(os.getenv("ML_PSI_SPAN_S", "21600"))
+PSI_SHIFT = float(os.getenv("ML_PSI_SHIFT", "0.25"))
+
 DB = {
     "host": os.getenv("DB_HOST", "postgres"),
     "port": int(os.getenv("DB_PORT", "5432")),
@@ -81,16 +93,23 @@ def now_iso(ts=None):
 # ───────────────────────── 기준 분포 (드리프트 비교용) ─────────────────────────
 
 def reference_bins():
-    """Gold 궤적(학습 데이터)의 속도·고도 십분위 경계. 실패하면 드리프트 계산만 끈다."""
+    """Gold 궤적(학습 데이터)의 속도·고도 십분위 경계. 실패하면 드리프트 계산만 끈다.
+
+    edges/ref = 행 단위(창별 참고값용, 예전과 같음), ac_edges/ac_ref = **항공기 단위**(날짜·항공기별 중앙값 —
+    드리프트 판정용, 실시간 쪽도 항공기당 1개로 비교하므로 양쪽 단위를 맞춘다)."""
     try:
         con = J.connect()
         df = con.execute(
-            f"SELECT velocity, baro_altitude FROM {J.scan('trajectory')} "
+            f"SELECT event_date, icao24, velocity, baro_altitude FROM {J.scan('trajectory')} "
             "WHERE velocity IS NOT NULL AND baro_altitude IS NOT NULL").df()
         dates = J.trajectory_dates(con)
         edges = {f: np.unique(np.quantile(df[f].to_numpy(), np.linspace(0, 1, 11))) for f in PSI_FEATURES}
         ref = {f: np.histogram(df[f].to_numpy(), bins=_open_edges(edges[f]))[0] / len(df) for f in PSI_FEATURES}
-        return {"edges": edges, "ref": ref, "rows": int(len(df)), "dates": dates}
+        ac = df.groupby(["event_date", "icao24"])[list(PSI_FEATURES)].median()
+        ac_edges = {f: np.unique(np.quantile(ac[f].to_numpy(), np.linspace(0, 1, 11))) for f in PSI_FEATURES}
+        ac_ref = {f: np.histogram(ac[f].to_numpy(), bins=_open_edges(ac_edges[f]))[0] / len(ac) for f in PSI_FEATURES}
+        return {"edges": edges, "ref": ref, "ac_edges": ac_edges, "ac_ref": ac_ref,
+                "rows": int(len(df)), "aircraft_days": int(len(ac)), "dates": dates}
     except Exception as e:  # noqa: BLE001
         print(f"SERVING_WARN reference unavailable ({type(e).__name__}) — drift disabled", flush=True)
         return None
@@ -102,15 +121,42 @@ def _open_edges(e):
     return e
 
 
-def psi(values, f, reference):
-    """Population Stability Index. <0.1 안정, 0.1~0.25 주의, >0.25 뚜렷한 변화(관례적 기준)."""
+def psi(values, f, reference, level=""):
+    """Population Stability Index. level=""는 행 단위 경계, "ac_"는 항공기 단위 경계로 비교한다."""
     if reference is None or len(values) < 20:
         return None
-    live = np.histogram(values, bins=_open_edges(reference["edges"][f]))[0] / len(values)
-    ref = reference["ref"][f]
+    live = np.histogram(values, bins=_open_edges(reference[f"{level}edges"][f]))[0] / len(values)
+    ref = reference[f"{level}ref"][f]
     eps = 1e-4
     live, ref = np.clip(live, eps, None), np.clip(ref, eps, None)
     return round(float(np.sum((live - ref) * np.log(live / ref))), 4)
+
+
+def drift_verdict(history, reference, now):
+    """최근 PSI_SPAN_S 동안의 창별 '항공기 → (속도, 고도) 중앙값'을 모아 항공기 단위 PSI로 판정한다.
+
+    history: [(창 끝 시각, {icao24: {"velocity": v, "baro_altitude": a}}), ...]
+    반환: {"aircraft", "span_min", "psi", "status"} — status는 insufficient(200대 미만)/stable/shifted."""
+    recent = [(t, m) for t, m in history if now - t <= PSI_SPAN_S]
+    per_ac = {}
+    for _, m in recent:
+        for icao, vals in m.items():
+            per_ac.setdefault(icao, []).append(vals)
+    span_min = round((now - min(t for t, _ in recent)) / 60) if recent else 0
+    out = {"aircraft": len(per_ac), "span_min": span_min, "min_aircraft": PSI_MIN_AIRCRAFT,
+           "threshold": PSI_SHIFT, "psi": None, "status": "insufficient"}
+    if reference is None or "ac_edges" not in reference or len(per_ac) < PSI_MIN_AIRCRAFT:
+        return out
+    scores = {}
+    for f in PSI_FEATURES:
+        vals = [np.nanmedian([v[f] for v in obs if v[f] is not None]) for obs in per_ac.values()
+                if any(v[f] is not None for v in obs)]
+        vals = np.array([v for v in vals if not np.isnan(v)])
+        scores[f] = psi(vals, f, reference, level="ac_")
+    out["psi"] = scores
+    worst = max((s for s in scores.values() if s is not None), default=None)
+    out["status"] = "insufficient" if worst is None else ("shifted" if worst >= PSI_SHIFT else "stable")
+    return out
 
 
 # ───────────────────────── 실시간 데이터 → 예측 입력 ─────────────────────────
@@ -215,6 +261,7 @@ class Server:
         self.totals = {"predictions": 0, "scored": 0, "unscorable": 0}
         self.window_scored, self.window_origins, self.window_giveup = [], [], 0
         self.window_idx = 0
+        self.ac_history = []  # 드리프트 판정용 [(창 끝 시각, {icao24: 중앙값})], 최근 PSI_SPAN_S만
         self.last_cycle = {}
         self.notes = []
 
@@ -253,8 +300,22 @@ class Server:
             moved = [p["moved"] for p in sc]
             w["model"] = summarize([p["err_model"] for p in sc], moved)
             w["baseline"] = summarize([p["err_dr"] for p in sc], moved)
+        # 행 단위 창별 PSI는 참고값으로만 남긴다(표본이 항공기 수십 대라 잡음이 크다 — 판정은 아래 drift).
         w["psi"] = {f: psi(np.array([o[f] for o in self.window_origins if o[f] is not None and not np.isnan(o[f])]),
                            f, self.reference) for f in PSI_FEATURES}
+        per_ac = {}
+        for o in self.window_origins:
+            per_ac.setdefault(o["icao24"], []).append(o)
+        ac_medians = {}
+        for icao, obs in per_ac.items():
+            ac_medians[icao] = {}
+            for f in PSI_FEATURES:
+                vals = [o[f] for o in obs if o[f] is not None and not np.isnan(o[f])]
+                ac_medians[icao][f] = float(np.median(vals)) if vals else None
+        now = time.time()
+        self.ac_history.append((now, ac_medians))
+        self.ac_history = [(t, m) for t, m in self.ac_history if now - t <= PSI_SPAN_S]
+        w["drift"] = drift_verdict(self.ac_history, self.reference, now)
         self.windows.append(w)
         self.windows = self.windows[-WINDOWS_KEEP:]
         if self.run_id and sc:
@@ -265,6 +326,10 @@ class Server:
                 for f, v in w["psi"].items():
                     if v is not None:
                         metrics[f"psi/{f}"] = v
+                metrics["drift/aircraft"] = w["drift"]["aircraft"]
+                for f, v in (w["drift"]["psi"] or {}).items():
+                    if v is not None:
+                        metrics[f"drift_psi/{f}"] = v
                 for k, v in metrics.items():
                     self.client.log_metric(self.run_id, k, v, step=self.window_idx)
             except Exception as e:  # noqa: BLE001
@@ -272,7 +337,7 @@ class Server:
         m, b = w.get("model", {}), w.get("baseline", {})
         print(f"SERVING_WINDOW idx={self.window_idx} v{self.version} scored={w['scored']} "
               f"hit100 model={m.get('hit_rate_pct', {}).get('100')} baseline={b.get('hit_rate_pct', {}).get('100')} "
-              f"psi={w['psi']}", flush=True)
+              f"psi={w['psi']} drift={w['drift']['status']} aircraft={w['drift']['aircraft']}", flush=True)
         self.window_idx += 1
         self.window_scored, self.window_origins, self.window_giveup = [], [], 0
 
@@ -285,7 +350,9 @@ class Server:
             "model": {"name": MODEL_NAME, "version": int(self.version) if self.version else None},
             "cycle_s": CYCLE_S, "window_s": WINDOW_S,
             "experiment": EXPERIMENT, "mlflow_run_id": self.run_id,
-            "reference": {k: self.reference[k] for k in ("rows", "dates")} if self.reference else None,
+            "reference": {k: self.reference[k] for k in ("rows", "aircraft_days", "dates")} if self.reference else None,
+            "drift_rule": {"min_aircraft": PSI_MIN_AIRCRAFT, "span_s": PSI_SPAN_S, "shift_threshold": PSI_SHIFT,
+                           "unit": "one sample per aircraft (median)"},
             "totals": self.totals, "last_cycle": self.last_cycle, "notes": self.notes[-10:],
             "windows": self.windows,
         }

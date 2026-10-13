@@ -83,11 +83,18 @@ function MapFocusHandler({ center, mode }) {
   return null;
 }
 
+// 같은 모양의 아이콘은 같은 객체를 돌려준다 — 위치 보정(아래 projectPosition)으로 마커가 초당 4번 다시 그려지는데,
+// 매번 새 divIcon을 만들면 Leaflet이 아이콘 DOM을 통째로 갈아 끼운다. 방향은 1도 단위로 묶는다.
+const iconCache = new Map();
 const aircraftIcon = (flight, active, theme) => {
   const color = bandOf(flight).color;
   const stroke = theme === 'dark' ? '#061018' : '#ffffff';
-  const heading = flight.true_track;
-  return L.divIcon({
+  const heading = Math.round(flight.true_track || 0);
+  const cacheKey = `${color}|${heading}|${active ? 1 : 0}|${theme}`;
+  const cached = iconCache.get(cacheKey);
+  if (cached) return cached;
+  if (iconCache.size > 2000) iconCache.clear();
+  const icon = L.divIcon({
     className: `aircraft-icon ${active ? 'active' : ''}`,
     html: `
       <div class="aircraft-icon-ring"></div>
@@ -98,7 +105,33 @@ const aircraftIcon = (flight, active, theme) => {
     iconSize: [26, 26],
     iconAnchor: [13, 13],
   });
+  iconCache.set(cacheKey, icon);
+  return icon;
 };
+
+// D (2026-10-13, 사용자 결정): 스냅샷 사이 위치 보정. 데이터는 약 10초마다 오는데, 그 사이에는 마지막 보고 위치에서
+// 보고된 속도·진행 방향대로 경과 시간만큼 이동시킨 **추정 위치**를 그린다(추측항법 — ML 리포트의 기준선과 같은 방식,
+// 10초 뒤 위치 오차 중앙값 약 43 m). 기준 시각은 **위치를 실제로 보고한 시각(time_position)** — 스냅샷 시각을 쓰면 위치가
+// 갱신되지 않은 기체가 스냅샷마다 약 2 km 뒤로 튀었다(실측 p90 1.4 km). 그래서 화면은 "몇 초 전 위치" 대신 "지금 추정 위치"를
+// 보여 준다. 보고 후 30초에서 멈춘다. 지상기·속도/방향 없는 기체는 보고 위치 그대로. 궤적 선은 실제 보고만.
+const MOTION_TICK_MS = 250;
+const MAX_EXTRAPOLATE_S = 30;
+const M_PER_DEG_LAT = 111320;
+
+function projectPosition(f, nowMs) {
+  const reported = [f.latitude, f.longitude];
+  if (isGrounded(f) || !(f.velocity > 0) || f.true_track == null) return reported;
+  // 보고 시각(epoch 초)을 우선 쓰고, 없으면(예전 응답) 스냅샷 시각으로 대신한다
+  const t0Ms = typeof f.time_position === 'number' ? f.time_position * 1000 : parseUtc(f.timestamp)?.getTime();
+  if (!t0Ms) return reported;
+  const dt = Math.min(Math.max((nowMs - t0Ms) / 1000, 0), MAX_EXTRAPOLATE_S);
+  const d = f.velocity * dt;
+  const rad = (f.true_track * Math.PI) / 180;
+  return [
+    f.latitude + (d * Math.cos(rad)) / M_PER_DEG_LAT,
+    f.longitude + (d * Math.sin(rad)) / (M_PER_DEG_LAT * Math.cos((f.latitude * Math.PI) / 180)),
+  ];
+}
 
 // reveals a section with a fade/slide-in transition the first time it scrolls into view
 function useReveal() {
@@ -188,6 +221,9 @@ function App() {
   const [countryFilter, setCountryFilter] = useState('all');
   const [sortKey, setSortKey] = useState('icao');
   const [airborneOnly, setAirborneOnly] = useState(false); // F-1: 지상기 숨기기(지도·목록 공통)
+  // D: 스냅샷 사이 위치 보정(추정). 켜져 있고 실시간 화면일 때만 0.25초마다 다시 그린다.
+  const [smoothMotion, setSmoothMotion] = useState(true);
+  const [motionNow, setMotionNow] = useState(() => Date.now());
   const [connected, setConnected] = useState(true);
   const [clock, setClock] = useState(new Date());
   const [theme, setTheme] = useState(readInitialTheme);
@@ -390,11 +426,23 @@ function App() {
     });
   }, [selectedFlight]);
 
-  // Follow 모드: 선택한 기체가 움직일 때마다 지도가 따라간다.
+  // D: 위치 보정 시계 — 실시간 화면이 보일 때만 돈다(Model Report를 보는 동안 지도를 다시 그리지 않게).
+  useEffect(() => {
+    if (!smoothMotion || view !== 'live') return undefined;
+    const id = setInterval(() => setMotionNow(Date.now()), MOTION_TICK_MS);
+    return () => clearInterval(id);
+  }, [smoothMotion, view]);
+
+  // Follow 모드: 선택한 기체가 움직일 때마다 지도가 따라간다. 위치 보정이 켜져 있으면 추정 위치를
+  // 1초마다(clock) 따라간다 — 0.25초마다 지도를 옮기면 이동 애니메이션이 겹쳐 오히려 끊겨 보인다.
   useEffect(() => {
     if (!followMode || !selectedFlight) return;
-    setMapCenter([selectedFlight.latitude, selectedFlight.longitude]);
-  }, [followMode, selectedFlight]);
+    setMapCenter(
+      smoothMotion
+        ? projectPosition(selectedFlight, clock.getTime())
+        : [selectedFlight.latitude, selectedFlight.longitude]
+    );
+  }, [followMode, selectedFlight, smoothMotion, clock]);
 
   // 선택이 풀리면 Follow도 함께 해제 (따라갈 대상이 없으므로)
   useEffect(() => {
@@ -700,7 +748,7 @@ function App() {
             {(airborneOnly ? flights.filter((f) => !isGrounded(f)) : flights).map((flight) => (
               <Marker
                 key={flight.icao24}
-                position={[flight.latitude, flight.longitude]}
+                position={smoothMotion ? projectPosition(flight, motionNow) : [flight.latitude, flight.longitude]}
                 icon={aircraftIcon(flight, selectedIcao === flight.icao24, theme)}
                 eventHandlers={{ click: () => handleSelect(flight) }}
               >
@@ -838,6 +886,13 @@ function App() {
             <label className="fleet-toggle" title="Hide aircraft on the ground (map and list)">
               <input type="checkbox" checked={airborneOnly} onChange={(e) => setAirborneOnly(e.target.checked)} />
               Airborne only{stats.grounded ? ` (${stats.grounded} on ground)` : ''}
+            </label>
+            <label
+              className="fleet-toggle"
+              title="Between updates (about every 10 s), move each airborne aircraft along its reported speed and heading. Positions are estimates; the trail shows only reported positions. Stops after 30 s without data."
+            >
+              <input type="checkbox" checked={smoothMotion} onChange={(e) => setSmoothMotion(e.target.checked)} />
+              Smooth motion (estimated)
             </label>
             {pinned.size > 0 && (
               <span className="fleet-pinned-count" title="Pinned aircraft">★ {pinned.size}</span>

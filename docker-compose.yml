@@ -613,6 +613,10 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:-mypassword}
       - DB_NAME=${DB_NAME:-flightdb}
       - ML_MONITOR_WINDOW_S=${ML_MONITOR_WINDOW_S:-300}
+      # 드리프트 판정 기준(2026-10-13, 권장값 — Gold 8일치로 역산): 항공기 단위 PSI, 최근 6시간, 200대 이상, 0.25 이상이면 변화
+      - ML_PSI_MIN_AIRCRAFT=${ML_PSI_MIN_AIRCRAFT:-200}
+      - ML_PSI_SPAN_S=${ML_PSI_SPAN_S:-21600}
+      - ML_PSI_SHIFT=${ML_PSI_SHIFT:-0.25}
     volumes:
       - ./src:/app/src:ro
       - ./flight-ui/public/ml-report:/app/ml_report

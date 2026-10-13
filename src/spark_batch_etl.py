@@ -95,7 +95,9 @@ def run_date(spark, date_str):
     # positions/에는 _spark_metadata가 없다(콜드 패스가 foreachBatch인 이유).
     # 따라서 평범한 디렉터리 읽기가 맞다.
     try:
-        df_raw = spark.read.parquet(source)
+        # mergeSchema: 컬럼이 늘어난 날(예: ingested_at 추가일)은 한 폴더에 옛 파일과 새 파일이 섞인다. 기본값은 파일
+        # 하나의 스키마만 보고 읽어 새 컬럼을 통째로 놓칠 수 있다 — 모든 파일의 스키마를 합쳐 읽는다(없는 쪽은 null).
+        df_raw = spark.read.option("mergeSchema", "true").parquet(source)
     except Exception as e:
         # 경로 자체가 없는 경우. DAG는 존재하는 dt= 접두사만 넘기므로 정상
         # 흐름에서는 나오지 않지만, 넘긴 뒤 지워졌을 수 있다.

@@ -197,6 +197,7 @@ def fetch_and_send():
     null_key_batch = 0
     try:
         response = session.get(URL, params=PARAMS, timeout=10)
+        ingested_at = time.time()  # 수집 시각 — 응답을 받은 순간(모든 레코드에 같은 값)
         response.raise_for_status()
         data = response.json()
 
@@ -222,7 +223,7 @@ def fetch_and_send():
             # 필드 정의와 변환 규칙은 src/flight_schema.py 한 곳에만 있다.
             # 여기에 dict를 직접 쓰면 Spark의 StructType과 또 갈라진다
             # (2026-09-10 실측: 3개 필드가 30,528행 전부 null이었다).
-            flight_info = build_record(state, data['time'])
+            flight_info = build_record(state, data['time'], ingested_at)
             # icao24를 파티션 키로 사용 — Kafka는 파티션 '내부' 순서만 보장하므로,
             # 키 없이 보내면 라운드로빈으로 같은 기체의 연속 위치가 6개 파티션에
             # 흩어져 기체별 시간 순서가 깨진다. (2026-09-09 실측: 2회 이상 등장한

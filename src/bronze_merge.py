@@ -232,7 +232,9 @@ def run_date(client, get_spark, date_str):
     spark = get_spark()
     # ── 2. 목록의 파일만 읽기 ─────────────────────────────
     # 디렉터리가 아니라 파일을 하나하나 지정한다(불변 조건 2).
-    src = spark.read.parquet(*[s3a(o["Key"]) for o in originals])
+    # mergeSchema: 옛 파일과 새 컬럼이 있는 파일이 섞인 날, 기본 읽기는 한쪽 스키마만 써서 새 컬럼을 빠뜨린 채
+    # 병합할 수 있다 — 해시 검증도 빠진 컬럼 기준이라 통과해 버린다. 모든 파일의 스키마를 합쳐 읽는다.
+    src = spark.read.option("mergeSchema", "true").parquet(*[s3a(o["Key"]) for o in originals])
     # 파일 안에는 dt가 없다(경로에만 있음). 경로 추론으로 생기더라도 빼서 양쪽을 맞춘다.
     cols = [c for c in src.columns if c != "dt"]
     n_in, h_in = fingerprint(src, cols)

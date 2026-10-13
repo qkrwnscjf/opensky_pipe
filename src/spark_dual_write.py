@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, to_timestamp, from_unixtime, date_format,
+    from_json, col, to_timestamp, from_unixtime, date_format, timestamp_seconds,
     count as _count, sum as _sum, when, lit,
 )
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType, LongType, IntegerType
@@ -212,6 +212,7 @@ def parse_and_flag(df_raw):
         .withColumn("timestamp_fixed", to_timestamp(from_unixtime(col("timestamp")))) \
         .drop("timestamp") \
         .withColumnRenamed("timestamp_fixed", "timestamp") \
+        .withColumn("ingested_at", timestamp_seconds(col("ingested_at"))) \
         .withColumn(
             "_valid",
             col("latitude").isNotNull()
@@ -341,16 +342,24 @@ _PG_TYPES = {"string": "TEXT", "long": "BIGINT", "double": "DOUBLE PRECISION",
 # 작업이 하나 줄고, 두 테이블이 같은 배치 내용으로 함께 커밋된다.
 CURRENT_COLS = ["icao24", "callsign", "origin_country", "latitude", "longitude", "velocity",
                 "true_track", "geo_altitude", "baro_altitude", "on_ground", "vertical_rate",
-                "squawk", "timestamp"]
+                "squawk", "timestamp", "ingested_at", "time_position"]
+# ingested_at: 수집 시각(2026-10-12). time_position(2026-10-13): 화면의 위치 보정(D)이 "실제 위치 보고 시각"부터 추정해야
+# 해서 다시 넣었다 — 스냅샷 시각 기준으로 추정하면 위치가 갱신되지 않은 기체가 스냅샷마다 약 2 km 뒤로 튀었다.
 HISTORY_COLS = ["icao24", "time_position", "timestamp", "latitude", "longitude", "velocity",
                 "true_track", "baro_altitude", "vertical_rate", "on_ground"]
 _FIELD_TYPES = {name: type_name for name, type_name, _ in FLIGHT_FIELDS}
 
 
+# Kafka에서는 epoch 숫자로 오지만 parse_and_flag가 TimestampType으로 바꾸는 컬럼들 — Postgres에서도 TIMESTAMP.
+_TS_COLS = {"timestamp", "ingested_at"}
+
+
+def _col_type(c):
+    return "TIMESTAMP" if c in _TS_COLS else _PG_TYPES[_FIELD_TYPES[c]]
+
+
 def _cols_ddl(cols):
-    return ", ".join(
-        f"{c} TIMESTAMP" if c == "timestamp" else f"{c} {_PG_TYPES[_FIELD_TYPES[c]]}" for c in cols
-    )
+    return ", ".join(f"{c} {_col_type(c)}" for c in cols)
 
 
 def ensure_current_table():
@@ -371,6 +380,10 @@ def ensure_current_table():
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS flight_current ({cols_ddl}, PRIMARY KEY (icao24))"
             )
+            # 세션 중에 코드가 컬럼을 늘린 채 spark만 재시작하면(예: ingested_at, 2026-10-12) 기존 테이블에 없는
+            # 컬럼 때문에 매 쓰기가 실패한다 — 없으면 추가한다. 세션 시작 때는 테이블이 새로 만들어져 무해.
+            for c in CURRENT_COLS:
+                cur.execute(f"ALTER TABLE flight_current ADD COLUMN IF NOT EXISTS {c} {_col_type(c)}")
             # /flights가 여기에 5분 신선도 필터(WHERE timestamp >= ...)를 건다.
             # 테이블이 기체 수만큼(수백 행 이하)이라 지금 규모에선 없어도 무방하지만,
             # idx_flight_timestamp를 flight_data에 만든 것과 같은 패턴을 미리 맞춰둔다

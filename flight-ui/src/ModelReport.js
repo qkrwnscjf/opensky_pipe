@@ -675,11 +675,15 @@ function RetrainPanel({ onFinished }) {
 // 서빙이 돌고 있으면 15초마다 다시 읽는다. 파일이 없으면 구역을 그리지 않고 켜는 방법만 보여 준다.
 const MONITOR_URL = '/ml-report/ml_monitoring.json';
 
-function psiLabel(v) {
-  if (typeof v !== 'number') return '—';
-  if (v > 0.25) return `${v.toFixed(3)} ⚠ shift`;
-  if (v > 0.1) return `${v.toFixed(3)} · watch`;
-  return `${v.toFixed(3)} ✓`;
+// 드리프트 판정(ml_serving.drift_verdict): 항공기 단위 PSI, 최근 최대 6시간, 200대 이상일 때만, 0.25 이상이면 변화.
+// 창별 행 단위 PSI는 항공기 수십 대라 잡음이 커서(변화 없이도 절반 가까이 0.25 초과) 화면에서 판정으로 쓰지 않는다.
+function driftLabel(d) {
+  if (!d) return '—';
+  if (d.status === 'insufficient') return `collecting ${d.aircraft}/${d.min_aircraft} aircraft`;
+  const worst = Math.max(...Object.values(d.psi || {}).filter((v) => typeof v === 'number'));
+  return d.status === 'shifted'
+    ? `${worst.toFixed(3)} ⚠ shifted · ${d.aircraft} ac`
+    : `${worst.toFixed(3)} ✓ stable · ${d.aircraft} ac`;
 }
 
 function Monitoring() {
@@ -736,7 +740,8 @@ function Monitoring() {
       </p>
       <p className="mr-ko">
         서빙을 켜면 champion 모델이 실시간 항공기의 10초 뒤 위치를 예측하고, 10초 뒤 들어오는 실제 보고로 바로 채점합니다.
-        같은 순간의 직진 가정과 나란히 비교하고, 입력 분포가 학습 데이터와 달라졌는지(PSI)도 봅니다. 평소에는 꺼 둡니다.
+        같은 순간의 직진 가정과 나란히 비교하고, 입력 분포가 학습 데이터와 달라졌는지(PSI)도 봅니다. PSI는 항공기 200대 이상이
+        모였을 때만 판정하고(그 전엔 수집 중), 0.25 이상이면 변화로 봅니다. 평소에는 꺼 둡니다.
       </p>
       {!mon && (
         <div className="mr-meta">
@@ -785,8 +790,7 @@ function Monitoring() {
                     <th className="num">Baseline ≤100 m</th>
                     <th className="num">Model p50</th>
                     <th className="num">Baseline p50</th>
-                    <th className="num">PSI speed</th>
-                    <th className="num">PSI altitude</th>
+                    <th className="num">Drift (PSI, per aircraft)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -799,8 +803,7 @@ function Monitoring() {
                       <td className="num mono">{pct(w.baseline?.hit_rate_pct?.['100'])}</td>
                       <td className="num mono">{fmtM(w.model?.p50_m)}</td>
                       <td className="num mono">{fmtM(w.baseline?.p50_m)}</td>
-                      <td className="num mono">{psiLabel(w.psi?.velocity)}</td>
-                      <td className="num mono">{psiLabel(w.psi?.baro_altitude)}</td>
+                      <td className="num mono">{driftLabel(w.drift)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -808,7 +811,9 @@ function Monitoring() {
             </div>
           )}
           <div className="mr-meta">
-            Window {Math.round((mon.window_s || 0) / 60)} min · PSI: under 0.1 stable, 0.1–0.25 watch, over 0.25 shifted ·
+            Window {Math.round((mon.window_s || 0) / 60)} min · Drift: PSI on one sample per aircraft over the last{' '}
+            {Math.round((mon.drift_rule?.span_s || 21600) / 3600)} h, judged only with ≥{mon.drift_rule?.min_aircraft ?? 200} aircraft;
+            ≥{mon.drift_rule?.shift_threshold ?? 0.25} = shifted (calibrated on past days: no-drift p95 ≈ 0.22 at 200+ aircraft) ·
             reference = training data ({mon.reference ? `${fmtInt(mon.reference.rows)} rows, ${mon.reference.dates.length} days` : 'unavailable'}) ·
             MLflow experiment <span className="mono">{mon.experiment}</span> · updated {mon.generated_at ? fmtRunTime(mon.generated_at.replace(/[-:]/g, '')) : '—'}
             {(mon.notes || []).length > 0 && ` · ${mon.notes.join('; ')}`}
