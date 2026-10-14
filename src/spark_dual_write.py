@@ -639,7 +639,10 @@ def save_to_hot(batch_df, batch_id):
         finally:
             timings[name] = round((time.perf_counter() - started) * 1000, 1)
 
-    batch_df.persist()
+    # 1-37 (2026-10-13): 캐시한 원본을 따로 잡아 둔다. 아래에서 batch_df에 걸러낸 새 DataFrame을 다시 담는데,
+    # 예전에는 마지막 unpersist가 그 새 DataFrame에 불려 원본 캐시가 배치마다 하나씩 남았다(Spark는 계획이 같은
+    # 캐시만 지운다). 실측: hot 배치 41개 → 캐시 40개·1.03MB, 배치당 약 25.7KB씩 세션 내내 증가.
+    cached = batch_df.persist()
 
     # 기존 count() 자리를 단일 agg로 대체한다 — 액션 수는 그대로 1회이므로
     # 드롭 카운트가 공짜로 붙는다. count()가 배치의 50.7%를 차지한다는 실측이
@@ -723,7 +726,7 @@ def save_to_hot(batch_df, batch_id):
         if write_error is None:
             _timed("notify", notify_flight_update)
 
-    _timed("unpersist", batch_df.unpersist)
+    _timed("unpersist", cached.unpersist)
 
     # 예외로 중단됐어도 그 시점까지의 구간은 남긴다 — 어디서 끊겼는지가 곧 단서다.
     print("SINK_METRIC " + json.dumps({
